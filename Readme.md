@@ -272,30 +272,6 @@ Run `START.bat` again and the launcher will detect the models automatically.
 
 ---
 
-## ⚠️ Important
-
-### Don't upload model files to GitHub
-
-GGUF models can be several gigabytes in size.
-
-Instead, keep:
-
-```text
-models/
-```
-
-in the repository but add:
-
-```gitignore
-models/*.gguf
-```
-
-to `.gitignore`.
-
-Users can download the models from their respective model pages.
-
----
-
 ## 📜 Credits
 
 This project uses:
