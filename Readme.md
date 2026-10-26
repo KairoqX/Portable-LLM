@@ -30,9 +30,11 @@ Everything runs locally on your computer.
 ```text
 Portable-LLM/
 │
-├── START.bat              # Start the LLM
+├── START.bat              # Start the LLM (runs launcher.ps1)
 ├── STOP.bat               # Stop the LLM
-├── CONFIG.bat             # Configuration
+├── CONFIG.bat             # Configuration (CONTEXT / PORT / HOST are now read by the launcher)
+├── launcher.ps1 monitor.ps1 cpu-detect.ps1 lib/   # checks, live diagnostics
+├── tests/ tools/ docs/ archive/
 ├── README.md
 ├── .gitignore
 │
@@ -301,3 +303,25 @@ and feel free to contribute improvements!
 **Plug in. Run. Chat. No installation.**
 
 `USB → START.bat → 🤖`
+
+
+---
+
+## 🩺 CPU compatibility & performance diagnostics
+
+`START.bat` now prints a **CPU COMPATIBILITY REPORT** before starting:
+
+* Windows' OS-level CPU flags (not proof of how any `.exe` was compiled),
+* the CPU kernel set llama.cpp will pick, obtained by calling the bundled `ggml_backend_score()` (llama.cpp's own check),
+* whether the files in `llama/` are the exact files that were statically analysed (`llama/build-manifest.json`, SHA-256).
+  Anything else is labelled **UNVERIFIED**, never "verified".
+
+After start-up it prints the backend and ISA flags **llama.cpp itself reports**, and after **every request** a line such as
+`[CPU/haswell | AVX2 FMA F16C BMI2 | model.gguf]  prompt processing 26 tok @ 31.37 tok/s | generation 197 tok in 26.86 s @ 7.34 tok/s | total 27.68 s`
+with the session average on the next line. Logs: `logs/<timestamp>/session.log`, `requests.csv`, and `logs/latest-summary.txt`.
+
+Security: the server binds to `127.0.0.1` only (non-loopback `HOST` is refused) and starts with `--cors-origins localhost`,
+so arbitrary websites cannot read responses from it. This is not authentication.
+
+Environment switches: `PORTABLE_LLM_ALLOW_UNVERIFIED=1`, `PORTABLE_LLM_QUIET=1`, `PORTABLE_LLM_NO_BROWSER=1`, `PORTABLE_LLM_PORT`, `PORTABLE_LLM_CONTEXT`.
+Details and limits: `docs/BUILD-EVIDENCE.md`. Test on Windows: `powershell -ExecutionPolicy Bypass -File tests\Run-Tests.ps1`.

@@ -1,0 +1,564 @@
+{
+  "schema": 1,
+  "generated_utc": "2026-10-26T05:52:09Z",
+  "generator": "tools/analyze_bundle.py (static disassembly with GNU objdump; no execution)",
+  "llama_cpp": {
+    "build": "10453",
+    "commit": "3cb7ffb1a",
+    "version_string": "0.1.0-dev",
+    "compiler": "Clang 20.1.8",
+    "target": "Windows x86_64",
+    "evidence": "ASCII strings found in llama-common.dll, llama-server-impl.dll, ggml-base.dll, llama.dll"
+  },
+  "layout": "ggml-backend-dl: one ggml-cpu-<variant>.dll per ISA level; ggml.dll loads all, calls each ggml_backend_score() and uses the highest non-zero score",
+  "preference": 100,
+  "min_host_features": [
+    "AVX2"
+  ],
+  "min_host_features_basis": "CONSERVATIVE. llama-server-impl.dll and llama-common.dll each contain a contiguous routine of ~400 instructions made entirely of VEX encodings including 256-bit integer ops (AVX2); no CPUID/feature guard was found at its call site. Other VEX regions in generic modules look like MSVC STL vectorised helpers; the ones traced (ggml-cpu-x64, ggml-cpu-sse42, ggml-rpc, mtmd) branch on a flag populated by CPUID/XGETBV. Not every region was traced, so AVX2 is used as the minimum for this bundle.",
+  "supports_cli": [
+    "--cors-origins",
+    "--cors-methods",
+    "--cors-headers",
+    "--cors-credentials",
+    "--api-key"
+  ],
+  "supports_cli_evidence": "ASCII option strings present in llama-common.dll / llama-server-impl.dll",
+  "core_modules": [
+    {
+      "file": "llama-server.exe",
+      "sha256": "c932a2ac50dbdc5768399723e2e6e6295f7abcdf5243220729022c38ae2c415a",
+      "bytes": 9216,
+      "instructions_scanned": 1318,
+      "observed_isa": {},
+      "vex_regions": []
+    },
+    {
+      "file": "llama-server-impl.dll",
+      "sha256": "167a1a8890390fb47b5056123879c0c1116c39e62a92398c77dbaeb1d3bf806d",
+      "bytes": 9996288,
+      "instructions_scanned": 1263241,
+      "observed_isa": {
+        "AVX": 803,
+        "AVX2": 344,
+        "SSE41": 6,
+        "SSE42": 19
+      },
+      "vex_regions": [
+        {
+          "start": "0x180396eb3",
+          "end": "0x180397214",
+          "vex_instructions": 61,
+          "ymm_integer_ops": 0
+        },
+        {
+          "start": "0x1803987a0",
+          "end": "0x1803991df",
+          "vex_instructions": 379,
+          "ymm_integer_ops": 185
+        },
+        {
+          "start": "0x1804c0100",
+          "end": "0x1804c0756",
+          "vex_instructions": 79,
+          "ymm_integer_ops": 35
+        },
+        {
+          "start": "0x1804c1490",
+          "end": "0x1804c2aa8",
+          "vex_instructions": 284,
+          "ymm_integer_ops": 124
+        }
+      ]
+    },
+    {
+      "file": "llama-common.dll",
+      "sha256": "e616788eafbfad9c15a8c3adfab8107f232457ef0b5c70f963ee827dfaca2aee",
+      "bytes": 8077312,
+      "instructions_scanned": 1369255,
+      "observed_isa": {
+        "AVX": 814,
+        "AVX2": 349,
+        "SSE41": 7,
+        "SSE42": 19
+      },
+      "vex_regions": [
+        {
+          "start": "0x1803fa3b3",
+          "end": "0x1803fa714",
+          "vex_instructions": 61,
+          "ymm_integer_ops": 0
+        },
+        {
+          "start": "0x1803fbca0",
+          "end": "0x1803fc6df",
+          "vex_instructions": 379,
+          "ymm_integer_ops": 185
+        },
+        {
+          "start": "0x1805235a0",
+          "end": "0x180523b66",
+          "vex_instructions": 72,
+          "ymm_integer_ops": 34
+        },
+        {
+          "start": "0x180524880",
+          "end": "0x1805260e8",
+          "vex_instructions": 302,
+          "ymm_integer_ops": 130
+        }
+      ]
+    },
+    {
+      "file": "llama.dll",
+      "sha256": "a96f1296b0def822306ca80e8d1ee71bf450d609d2b5fde2733a7d8ab5549cab",
+      "bytes": 2921472,
+      "instructions_scanned": 546726,
+      "observed_isa": {
+        "AVX": 174,
+        "AVX2": 77,
+        "SSE41": 7,
+        "SSE42": 18
+      },
+      "vex_regions": [
+        {
+          "start": "0x180220b78",
+          "end": "0x180221136",
+          "vex_instructions": 71,
+          "ymm_integer_ops": 32
+        },
+        {
+          "start": "0x180221ac0",
+          "end": "0x180221b34",
+          "vex_instructions": 11,
+          "ymm_integer_ops": 6
+        },
+        {
+          "start": "0x180221f8f",
+          "end": "0x180222532",
+          "vex_instructions": 92,
+          "ymm_integer_ops": 39
+        }
+      ]
+    },
+    {
+      "file": "ggml.dll",
+      "sha256": "1defc07c048a19d5edc8243f79eb120b1864dd6ae4cd816577dee2e47db1aca5",
+      "bytes": 86016,
+      "instructions_scanned": 15332,
+      "observed_isa": {
+        "AVX": 74,
+        "AVX2": 33,
+        "SSE41": 1,
+        "SSE42": 3
+      },
+      "vex_regions": [
+        {
+          "start": "0x18000bed8",
+          "end": "0x18000c6a6",
+          "vex_instructions": 74,
+          "ymm_integer_ops": 33
+        }
+      ]
+    },
+    {
+      "file": "ggml-base.dll",
+      "sha256": "842c3084ed1817c3a0bbc0da396c0b46e18d0b3f2a87171104a6c12029524988",
+      "bytes": 773632,
+      "instructions_scanned": 142469,
+      "observed_isa": {},
+      "vex_regions": []
+    },
+    {
+      "file": "mtmd.dll",
+      "sha256": "958c1df28e095d837231afd0c53644761accea484011e66db0b60c780f95b0b6",
+      "bytes": 1606656,
+      "instructions_scanned": 294015,
+      "observed_isa": {
+        "AVX": 69,
+        "AVX2": 34,
+        "SSE41": 4,
+        "SSE42": 3
+      },
+      "vex_regions": [
+        {
+          "start": "0x18013d131",
+          "end": "0x18013d899",
+          "vex_instructions": 69,
+          "ymm_integer_ops": 34
+        }
+      ]
+    },
+    {
+      "file": "ggml-rpc.dll",
+      "sha256": "325961156733914a9fb29f23f2eeef268fdc8f00ec1cfff4fcd2abc6c8ec3352",
+      "bytes": 137728,
+      "instructions_scanned": 24934,
+      "observed_isa": {
+        "AVX": 24,
+        "AVX2": 12
+      },
+      "vex_regions": [
+        {
+          "start": "0x180014c48",
+          "end": "0x180014e14",
+          "vex_instructions": 24,
+          "ymm_integer_ops": 12
+        }
+      ]
+    },
+    {
+      "file": "libomp140.x86_64.dll",
+      "sha256": "4a20c1e5c115c29771a12324513eb109badac72180f79481527ad79d996ffb33",
+      "bytes": 661856,
+      "instructions_scanned": 130863,
+      "observed_isa": {
+        "AVX": 2
+      },
+      "vex_regions": [
+        {
+          "start": "0x180001d6d",
+          "end": "0x180001dc1",
+          "vex_instructions": 2,
+          "ymm_integer_ops": 0
+        }
+      ]
+    }
+  ],
+  "cpu_variants": [
+    {
+      "variant": "x64",
+      "file": "ggml-cpu-x64.dll",
+      "sha256": "1c923a0d3b6a85b075583442c027871c8e739f910f088bff4b41ac0c01136165",
+      "bytes": 870400,
+      "declared_requires": [],
+      "observed_isa": {
+        "AVX": 13,
+        "AVX2": 6
+      },
+      "observed_consistent_with_declared": true,
+      "consistency_notes": []
+    },
+    {
+      "variant": "sse42",
+      "file": "ggml-cpu-sse42.dll",
+      "sha256": "5864f20f1b3153981143af64006df139ea9b4f0e3e84247f56ed7c210700c00d",
+      "bytes": 877568,
+      "declared_requires": [
+        "SSE42"
+      ],
+      "observed_isa": {
+        "AVX": 13,
+        "AVX2": 6,
+        "SSE41": 1448,
+        "SSE42": 4
+      },
+      "observed_consistent_with_declared": true,
+      "consistency_notes": []
+    },
+    {
+      "variant": "sandybridge",
+      "file": "ggml-cpu-sandybridge.dll",
+      "sha256": "2fdba55df879ab0b287e6bc9eb1e14ad7b06bc96acbe528c24d67605fab788ea",
+      "bytes": 1054208,
+      "declared_requires": [
+        "SSE42",
+        "AVX"
+      ],
+      "observed_isa": {
+        "AVX": 40145,
+        "AVX2": 7
+      },
+      "observed_consistent_with_declared": true,
+      "consistency_notes": []
+    },
+    {
+      "variant": "ivybridge",
+      "file": "ggml-cpu-ivybridge.dll",
+      "sha256": "ca9c6269fe0ff67eb6db01022a590fa90487bf34af686650c95840c0f9db30dc",
+      "bytes": 1074176,
+      "declared_requires": [
+        "SSE42",
+        "AVX",
+        "F16C"
+      ],
+      "observed_isa": {
+        "AVX": 41499,
+        "AVX2": 7,
+        "F16C": 132
+      },
+      "observed_consistent_with_declared": true,
+      "consistency_notes": []
+    },
+    {
+      "variant": "piledriver",
+      "file": "ggml-cpu-piledriver.dll",
+      "sha256": "26e00d3cfbfd93abac1ab7e49619c8f4a99d9ee60b1d4093ef72641f687ef747",
+      "bytes": 1077760,
+      "declared_requires": [
+        "SSE42",
+        "AVX",
+        "F16C",
+        "FMA"
+      ],
+      "observed_isa": {
+        "AVX": 41098,
+        "AVX2": 7,
+        "F16C": 132,
+        "FMA": 1301
+      },
+      "observed_consistent_with_declared": true,
+      "consistency_notes": []
+    },
+    {
+      "variant": "haswell",
+      "file": "ggml-cpu-haswell.dll",
+      "sha256": "fcbc59fbb499093108e7bd09de2658ab9ec8e21c7a4c2638d415f212d193548b",
+      "bytes": 1185280,
+      "declared_requires": [
+        "SSE42",
+        "AVX",
+        "F16C",
+        "AVX2",
+        "BMI2",
+        "FMA"
+      ],
+      "observed_isa": {
+        "AVX": 53077,
+        "AVX2": 11389,
+        "BMI2": 61,
+        "F16C": 172,
+        "FMA": 1521
+      },
+      "observed_consistent_with_declared": true,
+      "consistency_notes": []
+    },
+    {
+      "variant": "alderlake",
+      "file": "ggml-cpu-alderlake.dll",
+      "sha256": "5843b60812d061bbf487e5ae412fe1c9a21c7f3100ffe0625ec971d80504ee34",
+      "bytes": 1181184,
+      "declared_requires": [
+        "SSE42",
+        "AVX",
+        "F16C",
+        "AVX2",
+        "BMI2",
+        "FMA",
+        "AVX_VNNI"
+      ],
+      "observed_isa": {
+        "AVX": 51856,
+        "AVX2": 10268,
+        "BMI2": 61,
+        "F16C": 172,
+        "FMA": 1521
+      },
+      "observed_consistent_with_declared": true,
+      "consistency_notes": []
+    },
+    {
+      "variant": "skylakex",
+      "file": "ggml-cpu-skylakex.dll",
+      "sha256": "fd75b80354040c74b6c223d8b320703874833fb37777d8d4e2a755249ddcd678",
+      "bytes": 1389568,
+      "declared_requires": [
+        "SSE42",
+        "AVX",
+        "F16C",
+        "AVX2",
+        "BMI2",
+        "FMA",
+        "AVX512"
+      ],
+      "observed_isa": {
+        "AVX": 67527,
+        "AVX2": 11023,
+        "AVX512": 41245,
+        "BMI2": 108,
+        "F16C": 357,
+        "FMA": 2748
+      },
+      "observed_consistent_with_declared": true,
+      "consistency_notes": []
+    },
+    {
+      "variant": "cannonlake",
+      "file": "ggml-cpu-cannonlake.dll",
+      "sha256": "7ab9db5e91c6c24ae3789b1184e14c02a2435ae10485866fac7877cca282e94d",
+      "bytes": 1395712,
+      "declared_requires": [
+        "SSE42",
+        "AVX",
+        "F16C",
+        "AVX2",
+        "BMI2",
+        "FMA",
+        "AVX512",
+        "AVX512_VBMI"
+      ],
+      "observed_isa": {
+        "AVX": 68320,
+        "AVX2": 11174,
+        "AVX512": 41713,
+        "BMI2": 108,
+        "F16C": 357,
+        "FMA": 2748
+      },
+      "observed_consistent_with_declared": true,
+      "consistency_notes": []
+    },
+    {
+      "variant": "cascadelake",
+      "file": "ggml-cpu-cascadelake.dll",
+      "sha256": "c446b381a5c46ef1d5580b0c3c476113e58499d0df7342d87c0924514ea67b3d",
+      "bytes": 1382400,
+      "declared_requires": [
+        "SSE42",
+        "AVX",
+        "F16C",
+        "AVX2",
+        "BMI2",
+        "FMA",
+        "AVX512",
+        "AVX512_VNNI"
+      ],
+      "observed_isa": {
+        "AVX": 66557,
+        "AVX2": 9469,
+        "AVX512": 40266,
+        "BMI2": 108,
+        "F16C": 357,
+        "FMA": 2748,
+        "VNNI": 869
+      },
+      "observed_consistent_with_declared": true,
+      "consistency_notes": []
+    },
+    {
+      "variant": "icelake",
+      "file": "ggml-cpu-icelake.dll",
+      "sha256": "1dfb62b0403ad2cc23981ec4b972901495945cc310e0d1fe5148b175debdb993",
+      "bytes": 1389056,
+      "declared_requires": [
+        "SSE42",
+        "AVX",
+        "F16C",
+        "AVX2",
+        "BMI2",
+        "FMA",
+        "AVX512",
+        "AVX512_VBMI",
+        "AVX512_VNNI"
+      ],
+      "observed_isa": {
+        "AVX": 67378,
+        "AVX2": 9645,
+        "AVX512": 40687,
+        "BMI2": 108,
+        "F16C": 357,
+        "FMA": 2748,
+        "VNNI": 861
+      },
+      "observed_consistent_with_declared": true,
+      "consistency_notes": []
+    },
+    {
+      "variant": "cooperlake",
+      "file": "ggml-cpu-cooperlake.dll",
+      "sha256": "9b8cbd85b88055f25de9f9962a6254bbb87551aa5e9584c013c77267f4df0f1c",
+      "bytes": 1383424,
+      "declared_requires": [
+        "SSE42",
+        "AVX",
+        "F16C",
+        "AVX2",
+        "BMI2",
+        "FMA",
+        "AVX512",
+        "AVX512_VNNI",
+        "AVX512_BF16"
+      ],
+      "observed_isa": {
+        "AVX": 66446,
+        "AVX2": 9469,
+        "AVX512": 40139,
+        "AVX512_BF16": 494,
+        "BMI2": 108,
+        "F16C": 357,
+        "FMA": 2312,
+        "VNNI": 869
+      },
+      "observed_consistent_with_declared": true,
+      "consistency_notes": []
+    },
+    {
+      "variant": "zen4",
+      "file": "ggml-cpu-zen4.dll",
+      "sha256": "18bdaa65afcaf8e630e206cfc171c6c27c7262681a7bb4bf6e55d9b37d865c03",
+      "bytes": 1390080,
+      "declared_requires": [
+        "SSE42",
+        "AVX",
+        "F16C",
+        "AVX2",
+        "BMI2",
+        "FMA",
+        "AVX512",
+        "AVX512_VBMI",
+        "AVX512_VNNI",
+        "AVX512_BF16"
+      ],
+      "observed_isa": {
+        "AVX": 67267,
+        "AVX2": 9645,
+        "AVX512": 40560,
+        "AVX512_BF16": 494,
+        "BMI2": 108,
+        "F16C": 357,
+        "FMA": 2312,
+        "VNNI": 861
+      },
+      "observed_consistent_with_declared": true,
+      "consistency_notes": []
+    },
+    {
+      "variant": "sapphirerapids",
+      "file": "ggml-cpu-sapphirerapids.dll",
+      "sha256": "b8dd32712dedf17211fbe67dd9fa2f302b427f918dae15bfdca673367af43df9",
+      "bytes": 1660416,
+      "declared_requires": [
+        "SSE42",
+        "AVX",
+        "F16C",
+        "AVX2",
+        "BMI2",
+        "FMA",
+        "AVX512",
+        "AVX512_VBMI",
+        "AVX512_VNNI",
+        "AVX512_BF16",
+        "AMX_TILE",
+        "AMX_INT8"
+      ],
+      "observed_isa": {
+        "AMX": 306,
+        "AVX": 85958,
+        "AVX2": 9826,
+        "AVX512": 57813,
+        "AVX512_BF16": 494,
+        "BMI2": 116,
+        "F16C": 705,
+        "FMA": 3148,
+        "VNNI": 3285
+      },
+      "observed_consistent_with_declared": true,
+      "consistency_notes": []
+    }
+  ],
+  "limitations": [
+    "Static analysis shows which instruction classes are PRESENT, not which are EXECUTED on a given CPU.",
+    "Declared variant requirements follow upstream ggml naming; AVX512_VBMI / AVX_VNNI / AMX_TILE were not individually confirmed.",
+    "No Windows execution was performed while producing this manifest."
+  ]
+}
