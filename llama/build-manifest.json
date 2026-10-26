@@ -1,6 +1,9 @@
 {
   "schema": 1,
-  "generated_utc": "2026-10-26T05:52:09Z",
+  "trust": "LOCAL INTEGRITY ONLY. Generated from the very files it describes, stored beside them, unsigned. It detects accidental change; it does not prove who built these files or that they are safe.",
+  "coverage": "static import closure of llama-server.exe plus every ggml-*.dll that the backend loader scans: ggml-base.dll, ggml-cpu-alderlake.dll, ggml-cpu-cannonlake.dll, ggml-cpu-cascadelake.dll, ggml-cpu-cooperlake.dll, ggml-cpu-haswell.dll, ggml-cpu-icelake.dll, ggml-cpu-ivybridge.dll, ggml-cpu-piledriver.dll, ggml-cpu-sandybridge.dll, ggml-cpu-sapphirerapids.dll, ggml-cpu-skylakex.dll, ggml-cpu-sse42.dll, ggml-cpu-x64.dll, ggml-cpu-zen4.dll, ggml-rpc.dll, ggml.dll, libomp140.x86_64.dll, llama-common.dll, llama-server-impl.dll, llama-server.exe, llama.dll, mtmd.dll",
+  "not_covered": "other tools in the folder (llama-cli, llama-bench, ...) and system DLLs (MSVCP140, VCRUNTIME140, UCRT, KERNEL32...) which are NOT bundled and come from the PC",
+  "generated_utc": "2026-10-26T11:39:41Z",
   "generator": "tools/analyze_bundle.py (static disassembly with GNU objdump; no execution)",
   "llama_cpp": {
     "build": "10453",
@@ -15,7 +18,7 @@
   "min_host_features": [
     "AVX2"
   ],
-  "min_host_features_basis": "CONSERVATIVE. llama-server-impl.dll and llama-common.dll each contain a contiguous routine of ~400 instructions made entirely of VEX encodings including 256-bit integer ops (AVX2); no CPUID/feature guard was found at its call site. Other VEX regions in generic modules look like MSVC STL vectorised helpers; the ones traced (ggml-cpu-x64, ggml-cpu-sse42, ggml-rpc, mtmd) branch on a flag populated by CPUID/XGETBV. Not every region was traced, so AVX2 is used as the minimum for this bundle.",
+  "min_host_features_basis": "CONSERVATIVE. llama-server-impl.dll and llama-common.dll each contain a ~380-instruction routine made only of VEX instructions with 256-bit integer ops (AVX2). tools/trace_callers.py places it in code that references BoringSSL crypto self-test strings; no CPU-feature test was found on the statically resolvable call chain (indirect calls are unresolved, so this does not prove the routine is unguarded or unreachable). Other VEX regions look like MSVC STL helpers; the ones traced branch on a CPUID/XGETBV-populated flag. AVX2 is therefore used as the minimum for this bundle.",
   "supports_cli": [
     "--cors-origins",
     "--cors-methods",

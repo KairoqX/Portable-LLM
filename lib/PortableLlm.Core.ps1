@@ -26,7 +26,7 @@ $PLlmRx_LoadBackend = 'loaded\s+(\S+)\s+backend\s+from\s+(.+?)\s*$'
 # REGEX:Variant
 $PLlmRx_Variant = 'ggml-cpu-([A-Za-z0-9_]+)\.dll'
 # REGEX:Listening
-$PLlmRx_Listening = '(?i)server is listening on|http server (?:is )?listening|listening on http'
+$PLlmRx_Listening = '(?i)\blistening on\b|http server (?:is )?listening'
 # REGEX:CorsWarning
 $PLlmRx_CorsWarning = 'CORS is set to allow all origins'
 
@@ -199,16 +199,16 @@ function Get-PLlmSessionStats {
 }
 
 function Format-PLlmTag {
-    # Compact "[CPU/haswell | AVX2 FMA F16C BMI2 | model.gguf]" tag; unknown parts are shown as "?" - never guessed.
+    # Compact "[CPU/haswell | AVX2 FMA F16C BMI2 | model.gguf]" tag; unknown parts say UNKNOWN - never guessed.
     param($BackendInfo, $SysInfo, [string]$ModelName)
-    $b = '?'
+    $b = 'backend UNKNOWN'
     if ($BackendInfo) {
         $b = [string]$BackendInfo.Backend
         if ($BackendInfo.Variant) { $b = $b + '/' + $BackendInfo.Variant }
     }
-    $isa = '?'
+    $isa = 'ISA UNKNOWN'
     if ($SysInfo) { if ($SysInfo.Enabled.Count -gt 0) { $isa = ($SysInfo.Enabled -join ' ') } else { $isa = 'no SIMD flags' } }
-    $m = '?'
+    $m = 'model UNKNOWN'
     if ($ModelName) { $m = $ModelName }
     return ('[{0} | {1} | {2}]' -f $b, $isa, $m)
 }
@@ -289,19 +289,39 @@ function Resolve-PLlmHostFeatures {
             }
         }
     }
+    # The bundled scorer reads CPUID bits only (disassembly: no XGETBV in ggml_backend_score). If Windows says the OS
+    # does not provide a feature, treat it as unavailable even when the scorer accepted a variant: conservative.
+    if ($Pf) {
+        foreach ($k in @('SSE42','AVX','AVX2','AVX512')) {
+            if ($Pf.ContainsKey($k) -and $Pf[$k] -eq $false) { $feat[$k] = $false }
+        }
+    }
     return $feat
 }
 
 function Get-PLlmPredictedVariant {
-    # Highest non-zero scorer result, i.e. what ggml's loader will pick. $null if no scores or none supported.
+    # Mirrors the loader rule seen in ggml.dll (strictly greater score wins; 0 never wins).
+    # Returns $null when there are no scores, no non-zero score, or the top score is shared by two variants
+    # (the winner then depends on file enumeration order, which we do not claim to know).
     param($Scores)
     if ($null -eq $Scores) { return $null }
-    $best = $null; $bestScore = 0
-    foreach ($k in $Scores.Keys) {
-        $s = $Scores[$k]
-        if ($null -ne $s -and [int]$s -gt $bestScore) { $bestScore = [int]$s; $best = $k }
-    }
-    return $best
+    $bestScore = 0
+    foreach ($k in $Scores.Keys) { if ($null -ne $Scores[$k] -and [int]$Scores[$k] -gt $bestScore) { $bestScore = [int]$Scores[$k] } }
+    if ($bestScore -le 0) { return $null }
+    $top = @()
+    foreach ($k in $Scores.Keys) { if ($null -ne $Scores[$k] -and [int]$Scores[$k] -eq $bestScore) { $top += $k } }
+    if ($top.Count -ne 1) { return $null }
+    return $top[0]
+}
+
+function Get-PLlmResolvedBackend {
+    # The loaded CPU backend is known ONLY if llama.cpp logged exactly one distinct "loaded CPU backend from <path>".
+    # Zero lines -> $null (UNKNOWN). Several different paths -> $null (AMBIGUOUS). Never inferred from host CPU or file names on disk.
+    param($Seen)
+    $paths = @{}
+    foreach ($b in @($Seen)) { if ($b -and $b.Path) { $paths[$b.Path.ToLowerInvariant()] = $b } }
+    if ($paths.Count -eq 1) { return @($paths.Values)[0] }
+    return $null
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -315,27 +335,70 @@ function Get-PLlmFileSha256 {
     return (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
 }
 
+function Test-PLlmManifestSchema {
+    # Structural validation. A manifest that fails here must never produce "verified" (an empty manifest used to pass).
+    param($Manifest)
+    $errs = New-Object System.Collections.ArrayList
+    if ($null -eq $Manifest) { return @('manifest is empty') }
+    if ($Manifest.schema -ne 1) { [void]$errs.Add('unsupported or missing schema version') }
+    $core = @(); if ($Manifest.core_modules) { $core = @($Manifest.core_modules) }
+    $vars = @(); if ($Manifest.cpu_variants) { $vars = @($Manifest.cpu_variants) }
+    if ($core.Count -eq 0) { [void]$errs.Add('core_modules is missing or empty') }
+    $names = @{}
+    foreach ($e in ($core + $vars)) {
+        if ($null -eq $e -or [string]::IsNullOrEmpty([string]$e.file)) { [void]$errs.Add('entry without a file name'); continue }
+        $f = [string]$e.file
+        if ($f -match '[\\/:]' -or $f -eq '.' -or $f -eq '..' -or $f.Contains('..')) { [void]$errs.Add(('unsafe file name in manifest: {0}' -f $f)) }
+        if (([string]$e.sha256) -notmatch '^[0-9a-fA-F]{64}$') { [void]$errs.Add(('bad sha256 for {0}' -f $f)) }
+        if ($names.ContainsKey($f.ToLowerInvariant())) { [void]$errs.Add(('duplicate entry: {0}' -f $f)) }
+        $names[$f.ToLowerInvariant()] = $true
+    }
+    foreach ($req in @('llama-server.exe', 'ggml.dll', 'ggml-base.dll', 'llama.dll')) {
+        if (-not $names.ContainsKey($req)) { [void]$errs.Add(('required module not listed: {0}' -f $req)) }
+    }
+    $allowed = @('SSE42','AVX','F16C','AVX2','BMI2','FMA','AVX512','AVX_VNNI','AVX512_VBMI','AVX512_VNNI','AVX512_BF16','AMX_TILE','AMX_INT8')
+    foreach ($m in @($Manifest.min_host_features)) {
+        if ($m -and ($allowed -notcontains [string]$m)) { [void]$errs.Add(('unknown min_host_features entry: {0}' -f $m)) }
+    }
+    return @($errs)
+}
+
 function Test-PLlmManifest {
-    # Compares the files in $Dir with the SHA-256 values recorded in the manifest.
-    # Verified = every listed file present with matching hash AND no unlisted ggml-cpu-*.dll (it could be loaded and win).
-    param([string]$Dir, $Manifest, [scriptblock]$HashFunction)
+    # Compares the files in $Dir with the SHA-256 values recorded in the manifest.  Result.Verified means ONLY:
+    #   "the manifest is structurally valid, matches its sidecar digest (if present), every listed file is present with the
+    #    recorded hash, and no extra ggml-*.dll exists".  It does NOT establish who produced the manifest.
+    param([string]$Dir, $Manifest, [string]$ManifestPath, [scriptblock]$HashFunction)
     $problems = New-Object System.Collections.ArrayList
     if ($null -eq $HashFunction) { $HashFunction = { param($p) Get-PLlmFileSha256 $p } }
-    $listed = @{}
-    $entries = @()
-    if ($Manifest.core_modules) { $entries += @($Manifest.core_modules) }
-    if ($Manifest.cpu_variants) { $entries += @($Manifest.cpu_variants) }
-    foreach ($e in $entries) {
-        $listed[$e.file.ToLowerInvariant()] = $true
-        $p = Join-Path $Dir $e.file
-        if (-not (Test-Path -LiteralPath $p)) { [void]$problems.Add(('missing file: {0}' -f $e.file)); continue }
-        $h = & $HashFunction $p
-        if ($h -ne $e.sha256) { [void]$problems.Add(('hash differs from analysed file: {0}' -f $e.file)) }
+    foreach ($e in (Test-PLlmManifestSchema $Manifest)) { [void]$problems.Add(('invalid manifest: {0}' -f $e)) }
+    $sidecarState = 'absent'
+    if ($ManifestPath) {
+        $side = $ManifestPath + '.sha256'
+        if (Test-Path -LiteralPath $side) {
+            $want = ((Get-Content -LiteralPath $side -Raw) -split '\s+')[0].Trim().ToLowerInvariant()
+            $have = (& $HashFunction $ManifestPath)
+            if ($want -eq $have) { $sidecarState = 'matches' } else { $sidecarState = 'MISMATCH'; [void]$problems.Add('manifest does not match build-manifest.json.sha256 (edited or corrupted)') }
+        } else { [void]$problems.Add('no build-manifest.json.sha256 sidecar (manifest integrity unchecked)') }
     }
-    foreach ($f in @(Get-ChildItem -LiteralPath $Dir -Filter 'ggml-cpu-*.dll' -ErrorAction SilentlyContinue)) {
-        if (-not $listed.ContainsKey($f.Name.ToLowerInvariant())) { [void]$problems.Add(('unlisted CPU backend DLL (not analysed): {0}' -f $f.Name)) }
+    if ($problems.Count -eq 0 -or $Manifest) {
+        $listed = @{}
+        $entries = @()
+        if ($Manifest.core_modules) { $entries += @($Manifest.core_modules) }
+        if ($Manifest.cpu_variants) { $entries += @($Manifest.cpu_variants) }
+        foreach ($e in $entries) {
+            if ($null -eq $e -or [string]::IsNullOrEmpty([string]$e.file) -or ([string]$e.file) -match '[\\/:]') { continue }
+            $listed[([string]$e.file).ToLowerInvariant()] = $true
+            $p = Join-Path $Dir $e.file
+            if (-not (Test-Path -LiteralPath $p)) { [void]$problems.Add(('missing file: {0}' -f $e.file)); continue }
+            $h = & $HashFunction $p
+            if ($h -ne ([string]$e.sha256).ToLowerInvariant()) { [void]$problems.Add(('hash differs from analysed file: {0}' -f $e.file)) }
+        }
+        # ggml's loader scans the folder for ggml-*.dll backends (CPU variants, and GPU backends such as vulkan/cuda)
+        foreach ($f in @(Get-ChildItem -LiteralPath $Dir -Filter 'ggml-*.dll' -ErrorAction SilentlyContinue)) {
+            if (-not $listed.ContainsKey($f.Name.ToLowerInvariant())) { [void]$problems.Add(('unlisted backend DLL (not analysed, could be loaded): {0}' -f $f.Name)) }
+        }
     }
-    return [pscustomobject]@{ Verified = ($problems.Count -eq 0); Problems = @($problems) }
+    return [pscustomobject]@{ Verified = ($problems.Count -eq 0); Problems = @($problems); SidecarState = $sidecarState }
 }
 
 function Select-PLlmBuild {
@@ -362,7 +425,7 @@ function Select-PLlmBuild {
             if ($c.Verified) {
                 if ($missing.Count -gt 0) { $status = 'REJECTED'; $reason = ('host CPU lacks ' + ($missing -join ', ') + ' required by this build') }
                 elseif ($unknown.Count -gt 0) { $status = 'REJECTED'; $reason = ('cannot confirm host support for ' + ($unknown -join ', ')) }
-                else { $status = 'COMPATIBLE'; $reason = 'verified by file hashes; host meets the verified minimum' }
+                else { $status = 'COMPATIBLE'; $reason = 'files match the local manifest; host meets its recorded minimum' }
             } else {
                 $status = 'UNVERIFIED'
                 if ($c.Problems -and @($c.Problems).Count -gt 0) { $reason = (@($c.Problems)[0]) } else { $reason = 'no build manifest; compile-time ISA unknown' }
@@ -386,11 +449,14 @@ function Select-PLlmBuild {
 # ---------------------------------------------------------------------------------------------
 function Test-PLlmBackendAgainstHost {
     # Returns a list of findings: Level = OK | INFO | WARN | FAIL.  Never claims more than the evidence shows.
-    param($HostFeatures, $PredictedVariant, $BackendInfo, $SysInfo)
+    param($HostFeatures, $PredictedVariant, $BackendInfo, $SysInfo, [bool]$BackendAmbiguous = $false)
     $out = New-Object System.Collections.ArrayList
     function Add-F([string]$Level, [string]$Text) { [void]$out.Add([pscustomobject]@{ Level = $Level; Text = $Text }) }
-    if ($null -eq $BackendInfo) {
-        Add-F 'INFO' 'llama.cpp did not report which CPU backend it loaded (no "loaded ... backend from" line seen); backend is UNKNOWN.'
+    if ($null -eq $BackendInfo -and $BackendAmbiguous) {
+        Add-F 'WARN' 'llama.cpp logged several different "loaded CPU backend" paths; which one is in use is UNKNOWN (not guessed).'
+    }
+    elseif ($null -eq $BackendInfo) {
+        Add-F 'INFO' 'llama.cpp did not report which CPU backend it loaded (no "loaded CPU backend from" line seen); backend is UNKNOWN. The host CPU and DLL file names on disk are not used to guess it.'
     }
     elseif ($BackendInfo.Variant -and $PredictedVariant) {
         if ($BackendInfo.Variant -eq $PredictedVariant) {

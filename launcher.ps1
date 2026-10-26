@@ -157,10 +157,13 @@ function Invoke-PLlmMain {
     foreach ($c in $candidates) {
         if ($c.Manifest) {
             Write-Host ('  verifying file hashes for {0} (SHA-256) ...' -f $c.Name) -ForegroundColor DarkGray
-            $v = Test-PLlmManifest -Dir $c.Dir -Manifest $c.Manifest
+            $v = Test-PLlmManifest -Dir $c.Dir -Manifest $c.Manifest -ManifestPath (Join-Path $c.Dir 'build-manifest.json')
             $c.Verified = $v.Verified; $c.Problems = @($v.Problems)
-            if ($c.Manifest.min_host_features) { $c.MinFeatures = @($c.Manifest.min_host_features) }
-            if ($c.Manifest.preference) { $c.Preference = [int]$c.Manifest.preference }
+            # min_host_features / preference are only honoured from a structurally valid manifest
+            if (@(Test-PLlmManifestSchema $c.Manifest).Count -eq 0) {
+                if ($c.Manifest.min_host_features) { $c.MinFeatures = @($c.Manifest.min_host_features) }
+                if ($c.Manifest.preference) { $c.Preference = [int]$c.Manifest.preference }
+            }
         } elseif ($c.ManifestProblem) { $c.Problems = @($c.ManifestProblem) }
         else { $c.Problems = @('no build-manifest.json: compile-time instruction set unknown') }
 
@@ -239,6 +242,7 @@ function Invoke-PLlmMain {
         if ($unk.Count) { Write-Rep ('                     unknown (not claimed): {0}' -f ($unk -join ' ')) 'DarkGray' }
     }
     Write-Rep ' Builds found      :'
+    Write-Rep '                     ("COMPATIBLE" = files match the local manifest and the host meets its recorded minimum; it is not a proof of safety)' 'DarkGray'
     foreach ($r in $rows) {
         $col = 'Gray'
         switch ($r.Status) { 'COMPATIBLE' { $col = 'Green' } 'UNVERIFIED' { $col = 'Yellow' } 'REJECTED' { $col = 'Red' } 'MISSING' { $col = 'Red' } }
@@ -270,7 +274,7 @@ function Invoke-PLlmMain {
     $verOk = ($kind -eq 'VERIFIED')
     if ($verOk) {
         $minTxt = (@($chosen.MinFeatures) -join ', ')
-        $verText = ('VERIFIED BY FILE HASH - static scan of these exact files; minimum host ISA for the core modules: {0}; CPU kernels are chosen at run time by llama.cpp. This is NOT an execution test.' -f $minTxt)
+        $verText = ('FILES MATCH THE LOCAL ANALYSIS MANIFEST (integrity only). Static scan of these exact files recorded a minimum host ISA of {0}; the manifest is unsigned and stored beside the binaries, so its provenance is NOT established, and a static scan is not an execution test. CPU kernels are chosen by llama.cpp at run time.' -f $minTxt)
     } elseif ($overridden) {
         $verText = 'REJECTED FOR THIS CPU (override in effect); instruction-set compatibility NOT established'
     } else {
@@ -280,7 +284,7 @@ function Invoke-PLlmMain {
     }
     Write-Rep ''
     Write-Rep (' Selected          : {0}' -f $chosen.Name) 'White'
-    Write-Rep (' Build ISA verification: {0}' -f $verText) $(if ($verOk) { 'Green' } else { 'Yellow' })
+    Write-Rep (' Build ISA verification: {0}' -f $verText) $(if ($verOk) { 'Cyan' } else { 'Yellow' })
     if ($kind -eq 'UNVERIFIED') {
         Write-Rep ' [WARN] This build is UNVERIFIED. Do not assume it is the fast build for your CPU; the ISA line printed after start-up is the evidence.' 'Yellow'
     }

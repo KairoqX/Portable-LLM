@@ -47,7 +47,7 @@ function Get-PLlmLevelColor {
 
 function Write-PLlmFindings {
     param($State)
-    $findings = Test-PLlmBackendAgainstHost -HostFeatures $State.HostFeatures -PredictedVariant $State.Predicted -BackendInfo $State.Backend -SysInfo $State.SysInfo
+    $findings = Test-PLlmBackendAgainstHost -HostFeatures $State.HostFeatures -PredictedVariant $State.Predicted -BackendInfo $State.Backend -SysInfo $State.SysInfo -BackendAmbiguous $State.BackendAmbiguous
     foreach ($f in $findings) {
         Write-PLlmOut $State ('   [{0}] {1}' -f $f.Level, $f.Text) (Get-PLlmLevelColor $f.Level)
     }
@@ -59,25 +59,27 @@ function Write-PLlmReadyBanner {
     $line = '=' * 78
     Write-PLlmOut $State ''
     Write-PLlmOut $State $line 'Green'
-    Write-PLlmOut $State (' SERVER READY  {0}   (model loaded in about {1} s)' -f $State.Url, $secs) 'Green'
+    Write-PLlmOut $State (' HTTP SERVER LISTENING  {0}   (after {1} s; the model may still be loading - wait for the first answer)' -f $State.Url, $secs) 'Green'
     Write-PLlmOut $State $line 'Green'
-    $b = 'not reported by llama.cpp'
+    $b = 'UNKNOWN (llama.cpp has not logged a single "loaded CPU backend" line yet)'
+    if ($State.BackendAmbiguous) { $b = 'UNKNOWN (llama.cpp logged several different CPU backend paths)' }
     if ($State.Backend) { $b = ('{0}{1}  <-  {2}' -f $State.Backend.Backend, $(if ($State.Backend.Variant) { ' / ' + $State.Backend.Variant } else { '' }), $State.Backend.Path) }
-    $isa = 'not reported by llama.cpp (no system_info line seen)'
+    $isa = 'UNKNOWN (no system_info line seen yet)'
     if ($State.SysInfo) {
         $isa = ($State.SysInfo.Enabled -join ' ')
         if ([string]::IsNullOrEmpty($isa)) { $isa = '(no SIMD flags enabled in the loaded backend)' }
     }
-    Write-PLlmOut $State (' Build   : {0}' -f $(if ($State.BuildLine) { $State.BuildLine } else { 'not reported by llama.cpp' })) 'White'
+    Write-PLlmOut $State (' Build   : {0}' -f $(if ($State.BuildLine) { $State.BuildLine } else { 'UNKNOWN (no build line seen yet)' })) 'White'
     Write-PLlmOut $State (' Backend : {0}' -f $b) 'White'
     Write-PLlmOut $State (' ISA used: {0}' -f $isa) 'White'
     Write-PLlmOut $State '           (compile-time flags of the loaded backend as printed by llama.cpp; not a test of this CPU)' 'DarkGray'
     if ($State.SysInfo -and $null -ne $State.SysInfo.Threads) { Write-PLlmOut $State (' Threads : {0}' -f $State.SysInfo.Threads) 'White' }
     Write-PLlmOut $State (' Host    : {0}' -f $State.HostText) 'White'
-    Write-PLlmOut $State (' Build ISA verification: {0}' -f $State.VerificationText) $(if ($State.VerificationOk) { 'Green' } else { 'Yellow' })
+    Write-PLlmOut $State (' Build ISA verification: {0}' -f $State.VerificationText) $(if ($State.VerificationOk) { 'Cyan' } else { 'Yellow' })
     Write-PLlmOut $State (' Model   : {0}' -f $State.ModelName) 'White'
     Write-PLlmOut $State (' Log     : {0}' -f $State.LogPath) 'White'
     Write-PLlmFindings $State
+    $State.FindingsShown = $true
     Write-PLlmOut $State $line 'Green'
     Write-PLlmOut $State ' Speeds are printed after every request. Press Ctrl+C in this window (or run STOP.bat) to stop.' 'Green'
     Write-PLlmOut $State ''
@@ -140,10 +142,19 @@ function Invoke-PLlmLine {
     if ($null -eq $State.BuildLine -and $Line -match $PLlmRx_BuildInfo) { $State.BuildLine = $Matches[1].Trim() }
 
     $be = ConvertFrom-PLlmLoadBackendLine $Line
-    if ($be -and $be.Backend -eq 'CPU') { $State.Backend = $be }
-    elseif ($be -and $null -eq $State.Backend) { $State.OtherBackends += $be.Backend }
+    if ($be -and $be.Backend -eq 'CPU') {
+        [void]$State.CpuBackendsSeen.Add($be)
+        $State.Backend = Get-PLlmResolvedBackend $State.CpuBackendsSeen
+        $State.BackendAmbiguous = ($null -eq $State.Backend)
+    }
+    elseif ($be) { $State.OtherBackends += $be.Backend }
 
-    if ($null -eq $State.SysInfo -and $Line -match $PLlmRx_SystemInfo) { $State.SysInfo = ConvertFrom-PLlmSystemInfo $Line }
+    $newFacts = $false
+    if ($null -eq $State.SysInfo -and $Line -match $PLlmRx_SystemInfo) { $State.SysInfo = ConvertFrom-PLlmSystemInfo $Line; $newFacts = $true }
+    if ($State.Ready -and $State.FindingsShown -and ($newFacts -or $be)) {
+        Write-PLlmOut $State ' Update from llama.cpp output received after the banner:' 'Cyan'
+        Write-PLlmFindings $State
+    }
 
     if (-not $State.Ready -and $Line -match $PLlmRx_Listening) {
         $State.Ready = $true
@@ -154,6 +165,11 @@ function Invoke-PLlmLine {
     }
 
     $ev = ConvertFrom-PLlmTimingLine $Line
+    if ($ev -and $ev.Kind -eq 'Total' -and $State.Ready -and -not $State.FirstRequestChecked) {
+        $State.FirstRequestChecked = $true
+        Write-PLlmOut $State ' Backend/ISA status at the first completed request:' 'Cyan'
+        Write-PLlmFindings $State
+    }
     if ($ev) {
         $req = Add-PLlmTimingEvent -Session $State.Session -TimingEvent $ev
         if ($req) {
@@ -198,7 +214,7 @@ function Invoke-PLlmServerMonitor {
     $st = [pscustomobject]@{
         Log = $writer; LogPath = $logPath; CsvPath = (Join-Path $SessionDir 'requests.csv'); LatestPath = (Join-Path (Split-Path -Parent $SessionDir) 'latest-summary.txt')
         Session = (New-PLlmSession); LastRequest = $null; LastLines = (New-Object System.Collections.ArrayList)
-        Backend = $null; SysInfo = $null; BuildLine = $null; OtherBackends = @(); Ready = $false; CorsWarned = $false
+        Backend = $null; BackendAmbiguous = $false; CpuBackendsSeen = (New-Object System.Collections.ArrayList); FindingsShown = $false; SysInfo = $null; BuildLine = $null; OtherBackends = @(); Ready = $false; FirstRequestChecked = $false; CorsWarned = $false
         ModelName = $ModelName; Url = $Url; HostFeatures = $HostFeatures; Predicted = $PredictedVariant; HostText = $HostText
         VerificationText = $VerificationText; VerificationOk = $VerificationOk
         OpenBrowser = $OpenBrowser; Quiet = $Quiet; StartedAt = (Get-Date)

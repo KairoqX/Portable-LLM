@@ -313,7 +313,7 @@ and feel free to contribute improvements!
 
 * Windows' OS-level CPU flags (not proof of how any `.exe` was compiled),
 * the CPU kernel set llama.cpp will pick, obtained by calling the bundled `ggml_backend_score()` (llama.cpp's own check),
-* whether the files in `llama/` are the exact files that were statically analysed (`llama/build-manifest.json`, SHA-256).
+* whether the files in `llama/` match the local analysis manifest (`llama/build-manifest.json`, SHA-256; integrity only, not provenance).
   Anything else is labelled **UNVERIFIED**, never "verified".
 
 After start-up it prints the backend and ISA flags **llama.cpp itself reports**, and after **every request** a line such as

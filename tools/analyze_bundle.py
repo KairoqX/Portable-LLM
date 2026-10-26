@@ -5,13 +5,15 @@ llama/build-manifest.json, which the launcher uses to check that the files on di
 files that were analysed (SHA-256) and to read their ISA requirements.
 
 Requires: python3, GNU objdump (binutils) able to read pei-x86-64. No network.
-Usage:    python3 tools/analyze_bundle.py llama  > llama/build-manifest.json
+Usage:    python3 tools/analyze_bundle.py llama --out llama/build-manifest.json   (also writes .sha256 sidecar)
 
 What this CAN establish: which instruction classes are present in each module's machine code,
 and (for the per-ISA ggml-cpu-<variant>.dll files) whether that matches the variant's declared name.
 What it can NOT establish: that a given instruction is never executed on a CPU lacking it.
 """
 import sys, os, re, json, hashlib, subprocess, datetime, collections
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pe_min
 
 # Upstream ggml CMake variant names (GGML_CPU_ALL_VARIANTS). Declared requirements are the project's
 # naming convention; the analysis below cross-checks them against the instructions actually present.
@@ -86,7 +88,18 @@ def analyse(path):
     for r in regions: r['start'] = hex(r['start']); r['end'] = hex(r['end'])
     return n, dict(sorted(feats.items())), regions
 
-def main(d):
+def import_closure(d, root='llama-server.exe'):
+    """All bundled files reachable through static imports of llama-server.exe (loader-scanned ggml-*.dll are added by caller)."""
+    local = {f.lower(): f for f in os.listdir(d)}; seen = set(); todo = [root.lower()]
+    while todo:
+        f = todo.pop()
+        if f in seen or f not in local: continue
+        seen.add(f)
+        for dll in pe_min.parse(os.path.join(d, local[f]))['imports']:
+            if dll.lower() in local: todo.append(dll.lower())
+    return seen
+
+def main(d, out_path=None):
     mods, variants = [], []
     for name in CORE:
         p = os.path.join(d, name)
@@ -114,8 +127,18 @@ def main(d):
                          'declared_requires': req, 'observed_isa': f,
                          'observed_consistent_with_declared': not problems, 'consistency_notes': problems})
         print('scanned', name, file=sys.stderr)
+    closure = import_closure(d)
+    listed = {m['file'].lower() for m in mods} | {v['file'].lower() for v in variants}
+    loader_scanned = {f.lower() for f in os.listdir(d) if f.lower().startswith('ggml-') and f.lower().endswith('.dll')}
+    missing = sorted((closure | loader_scanned) - listed)
+    if missing:
+        sys.exit('ERROR: files the server can load are not covered by the manifest: %s' % missing)
     manifest = {
         'schema': 1,
+        'trust': 'LOCAL INTEGRITY ONLY. Generated from the very files it describes, stored beside them, unsigned. '
+                 'It detects accidental change; it does not prove who built these files or that they are safe.',
+        'coverage': 'static import closure of llama-server.exe plus every ggml-*.dll that the backend loader scans: ' + ', '.join(sorted(closure | loader_scanned)),
+        'not_covered': 'other tools in the folder (llama-cli, llama-bench, ...) and system DLLs (MSVCP140, VCRUNTIME140, UCRT, KERNEL32...) which are NOT bundled and come from the PC',
         'generated_utc': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
         'generator': 'tools/analyze_bundle.py (static disassembly with GNU objdump; no execution)',
         'llama_cpp': {'build': '10453', 'commit': '3cb7ffb1a', 'version_string': '0.1.0-dev',
@@ -126,11 +149,12 @@ def main(d):
         'preference': 100,
         'min_host_features': ['AVX2'],
         'min_host_features_basis': (
-            'CONSERVATIVE. llama-server-impl.dll and llama-common.dll each contain a contiguous routine of ~400 '
-            'instructions made entirely of VEX encodings including 256-bit integer ops (AVX2); no CPUID/feature '
-            'guard was found at its call site. Other VEX regions in generic modules look like MSVC STL vectorised '
-            'helpers; the ones traced (ggml-cpu-x64, ggml-cpu-sse42, ggml-rpc, mtmd) branch on a flag populated '
-            'by CPUID/XGETBV. Not every region was traced, so AVX2 is used as the minimum for this bundle.'),
+            'CONSERVATIVE. llama-server-impl.dll and llama-common.dll each contain a ~380-instruction routine made only of '
+            'VEX instructions with 256-bit integer ops (AVX2). tools/trace_callers.py places it in code that references '
+            'BoringSSL crypto self-test strings; no CPU-feature test was found on the statically resolvable call chain '
+            '(indirect calls are unresolved, so this does not prove the routine is unguarded or unreachable). Other VEX regions '
+            'look like MSVC STL helpers; the ones traced branch on a CPUID/XGETBV-populated flag. AVX2 is therefore used as '
+            'the minimum for this bundle.'),
         'supports_cli': ['--cors-origins', '--cors-methods', '--cors-headers', '--cors-credentials', '--api-key'],
         'supports_cli_evidence': 'ASCII option strings present in llama-common.dll / llama-server-impl.dll',
         'core_modules': mods,
@@ -140,7 +164,14 @@ def main(d):
             'Declared variant requirements follow upstream ggml naming; AVX512_VBMI / AVX_VNNI / AMX_TILE were not individually confirmed.',
             'No Windows execution was performed while producing this manifest.'],
     }
-    json.dump(manifest, sys.stdout, indent=2); print()
+    text = json.dumps(manifest, indent=2) + '\n'
+    if out_path:
+        with open(out_path, 'w', newline='\n') as f: f.write(text)
+        with open(out_path + '.sha256', 'w', newline='\n') as f:      # integrity sidecar (accidental-change detection only)
+            f.write('%s  %s\n' % (hashlib.sha256(text.encode()).hexdigest(), os.path.basename(out_path)))
+    else:
+        sys.stdout.write(text)
 
 if __name__ == '__main__':
-    main(sys.argv[1] if len(sys.argv) > 1 else 'llama')
+    a = sys.argv[1:]
+    main(a[0] if a else 'llama', a[a.index('--out') + 1] if '--out' in a else None)
