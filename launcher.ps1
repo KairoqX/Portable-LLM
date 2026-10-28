@@ -21,7 +21,9 @@ $ErrorActionPreference = 'Stop'
 if ([string]::IsNullOrEmpty($Root)) { $Root = $PSScriptRoot }
 $Root = (Resolve-Path -LiteralPath $Root).Path
 
-. (Join-Path $Root 'lib\PortableLlm.Core.ps1')
+. (Join-Path $Root 'lib/PortableLlm.Core.ps1')
+. (Join-Path $Root 'lib/PortableLlm.Sys.ps1')
+. (Join-Path $Root 'lib/PortableLlm.Tui.ps1')
 . (Join-Path $Root 'monitor.ps1')
 
 $script:Report = New-Object System.Collections.ArrayList
@@ -92,15 +94,6 @@ function Test-PLlmBinaryContains {
         if ($s.IndexOf($Text, [System.StringComparison]::Ordinal) -ge 0) { return $true }
     }
     return $false
-}
-
-function Test-PLlmPortFree {
-    param([int]$Port)
-    try {
-        $l = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
-        foreach ($e in $l) { if ($e.Port -eq $Port) { return $false } }
-    } catch { }
-    return $true
 }
 
 # ================================================================== main
@@ -358,13 +351,16 @@ function Invoke-PLlmMain {
     $quiet = ($env:PORTABLE_LLM_QUIET -eq '1')
     $openBrowser = (-not $NoBrowser.IsPresent -and $env:PORTABLE_LLM_NO_BROWSER -ne '1')
     Write-Rep ('Diagnostic log folder: {0}' -f $sessionDir) 'White'
-    Write-Rep 'Starting llama.cpp server - the browser opens when the model has finished loading ...' 'White'
+    Write-Rep 'Starting llama.cpp server - the dashboard opens next; the browser opens when the model has finished loading ...' 'White'
+    Write-Rep 'Dashboard keys: O open browser | D diagnostics | L log path | R redraw | Q stop server and quit.' 'White'
     Write-Rep ''
 
     $code = Invoke-PLlmServerMonitor -ServerExe $chosen.Path -ArgumentString $argText -WorkDir $chosen.Dir `
         -SessionDir $sessionDir -ModelName $picked.Name -Url $url -Port $port -HostFeatures $chosen.Features `
         -PredictedVariant $chosen.Predicted -HostText $hostText -VerificationText $verText -VerificationOk $verOk `
-        -HeaderLines @($script:Report) -OpenBrowser $openBrowser -Quiet $quiet
+        -HeaderLines @($script:Report) -OpenBrowser $openBrowser -Quiet $quiet `
+        -HostProbe $chosen.Probe -ModelBytes ([double]$picked.Length) -ContextRequested $ctx `
+        -VerificationKind $kind -VerificationProblems @($chosen.Problems)
     if ($code -eq -1073741510) { exit 0 }
     exit $code
 }

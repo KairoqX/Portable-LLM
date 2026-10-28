@@ -325,3 +325,8 @@ so arbitrary websites cannot read responses from it. This is not authentication.
 
 Environment switches: `PORTABLE_LLM_ALLOW_UNVERIFIED=1`, `PORTABLE_LLM_QUIET=1`, `PORTABLE_LLM_NO_BROWSER=1`, `PORTABLE_LLM_PORT`, `PORTABLE_LLM_CONTEXT`.
 Details and limits: `docs/BUILD-EVIDENCE.md`. Test on Windows: `powershell -ExecutionPolicy Bypass -File tests\Run-Tests.ps1`.
+
+## Terminal dashboard
+While the server runs, the terminal shows a live status dashboard (server state, model, speeds, system, compatibility, recent
+activity). Keys: **O** open browser, **D** diagnostics, **L** log path, **R** redraw, **Q** stop and quit. Chatting happens in the
+browser only. Details, fallbacks and manual test steps: `docs/TUI.md`.

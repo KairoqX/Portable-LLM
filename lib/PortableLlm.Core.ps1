@@ -30,6 +30,20 @@ $PLlmRx_Listening = '(?i)\blistening on\b|http server (?:is )?listening'
 # REGEX:CorsWarning
 $PLlmRx_CorsWarning = 'CORS is set to allow all origins'
 
+# REGEX:CtxReported
+$PLlmRx_CtxReported = '\bn_ctx(?:_seq)?\s*=\s*(\d+)'
+# REGEX:ModelLoadStart
+$PLlmRx_ModelLoadStart = '\(startup\) loading model|\bllama_model_loader:|\bload_tensors:'
+# REGEX:ModelLoaded
+$PLlmRx_ModelLoaded = '(?i)\bmodel loaded\b|all slots are idle'
+# REGEX:ErrorLine
+$PLlmRx_ErrorLine = '(?i)\b(?:error|fatal|exception)\b(?!\s*=\s*0)|\bfailed to\b|\bunable to\b|couldn''t|\bcannot\b|out of memory|\bbad_alloc\b'
+# REGEX:WarnLine
+$PLlmRx_WarnLine = '(?i)\bwarn(?:ing)?\b'
+
+# Shown in the dashboard header.  Change it here only.
+$script:PLlmVersion = '2.1'
+
 # ISA flags we show from llama.cpp's system_info line (order = display order)
 $script:PLlmIsaFlagOrder = @('SSE3','SSSE3','AVX','AVX_VNNI','AVX2','F16C','FMA','BMI2','AVX512','AVX512_VBMI','AVX512_VNNI','AVX512_BF16','AMX_INT8','AMX_TILE')
 
@@ -125,6 +139,7 @@ function New-PLlmSession {
     return [pscustomobject]@{
         Requests = (New-Object System.Collections.ArrayList)
         Current  = $null
+        Incomplete = 0
     }
 }
 
@@ -134,7 +149,10 @@ function Add-PLlmTimingEvent {
     param($Session, $TimingEvent)
     if ($null -eq $TimingEvent) { return $null }
     switch ($TimingEvent.Kind) {
-        'Prompt' { $Session.Current = [pscustomobject]@{ Prompt = $TimingEvent; Eval = $null; Total = $null; Seen = (Get-Date) }; return $null }
+        'Prompt' {
+            # a previous request that never reached its "total time" line is counted, not silently dropped
+            if ($null -ne $Session.Current -and $null -eq $Session.Current.Total) { $Session.Incomplete++ }
+            $Session.Current = [pscustomobject]@{ Prompt = $TimingEvent; Eval = $null; Total = $null; Seen = (Get-Date) }; return $null }
         'Eval'   {
             if ($null -eq $Session.Current) { $Session.Current = [pscustomobject]@{ Prompt = $null; Eval = $null; Total = $null; Seen = (Get-Date) } }
             $Session.Current.Eval = $TimingEvent
@@ -192,7 +210,7 @@ function Get-PLlmSessionStats {
     $gAvg = $null; if ($gMs -gt 0) { $gAvg = $gTok * 1000.0 / $gMs }
     $pAvg = $null; if ($pMs -gt 0) { $pAvg = $pTok * 1000.0 / $pMs }
     return [pscustomobject]@{
-        Requests = $n
+        Requests = $n; Incomplete = $Session.Incomplete
         GenTokens = $gTok; GenSeconds = ($gMs / 1000.0); GenAvgTps = $gAvg; GenMinTps = $gMin; GenMaxTps = $gMax
         PromptTokens = $pTok; PromptSeconds = ($pMs / 1000.0); PromptAvgTps = $pAvg; PromptMinTps = $pMin; PromptMaxTps = $pMax
     }
@@ -391,11 +409,11 @@ function Test-PLlmManifest {
             $p = Join-Path $Dir $e.file
             if (-not (Test-Path -LiteralPath $p)) { [void]$problems.Add(('missing file: {0}' -f $e.file)); continue }
             $h = & $HashFunction $p
-            if ($h -ne ([string]$e.sha256).ToLowerInvariant()) { [void]$problems.Add(('hash differs from analysed file: {0}' -f $e.file)) }
+            if ($h -ne ([string]$e.sha256).ToLowerInvariant()) { [void]$problems.Add(('hash differs: {0} (not the file that was analysed)' -f $e.file)) }
         }
         # ggml's loader scans the folder for ggml-*.dll backends (CPU variants, and GPU backends such as vulkan/cuda)
         foreach ($f in @(Get-ChildItem -LiteralPath $Dir -Filter 'ggml-*.dll' -ErrorAction SilentlyContinue)) {
-            if (-not $listed.ContainsKey($f.Name.ToLowerInvariant())) { [void]$problems.Add(('unlisted backend DLL (not analysed, could be loaded): {0}' -f $f.Name)) }
+            if (-not $listed.ContainsKey($f.Name.ToLowerInvariant())) { [void]$problems.Add(('unlisted backend DLL: {0} (not analysed; the loader could load it)' -f $f.Name)) }
         }
     }
     return [pscustomobject]@{ Verified = ($problems.Count -eq 0); Problems = @($problems); SidecarState = $sidecarState }
@@ -482,4 +500,93 @@ function Test-PLlmBackendAgainstHost {
         Add-F 'INFO' 'No "system_info" line seen yet; compile-time ISA flags of the loaded backend are UNKNOWN.'
     }
     return @($out)
+}
+
+# ---------------------------------------------------------------------------------------------
+# Dashboard helpers (pure: no console, no processes)
+# ---------------------------------------------------------------------------------------------
+function Close-PLlmSession {
+    # Call once when the server has exited: a request that started but never finished counts as incomplete.
+    param($Session)
+    if ($null -ne $Session.Current -and $null -eq $Session.Current.Total) { $Session.Incomplete++ }
+    $Session.Current = $null
+}
+
+function Format-PLlmBytes {
+    param($Bytes)
+    if ($null -eq $Bytes) { return 'unknown' }
+    $b = [double]$Bytes
+    if ($b -ge 1GB) { return ((Format-PLlmNumber ($b / 1GB) '0.00') + ' GB') }
+    if ($b -ge 1MB) { return ((Format-PLlmNumber ($b / 1MB) '0') + ' MB') }
+    return ((Format-PLlmNumber ($b / 1KB) '0') + ' KB')
+}
+
+function Format-PLlmDuration {
+    param([TimeSpan]$Span)
+    if ($Span.TotalDays -ge 1) { return ('{0}d {1:00}:{2:00}:{3:00}' -f [int][math]::Floor($Span.TotalDays), $Span.Hours, $Span.Minutes, $Span.Seconds) }
+    return ('{0:00}:{1:00}:{2:00}' -f [int][math]::Floor($Span.TotalHours), $Span.Minutes, $Span.Seconds)
+}
+
+# Memory thresholds (measured values only).  Levels: ok | warn | crit | unknown
+$script:PLlmMemThresholds = @{ WarnUsedPct = 85; CritUsedPct = 95; WarnAvailGB = 1.5; CritAvailGB = 0.75; HystPct = 3; HystGB = 0.25 }
+function Get-PLlmMemoryLevel {
+    # Previous gives hysteresis so the level does not flap around a threshold.
+    param($TotalBytes, $AvailBytes, [string]$Previous = 'ok')
+    if ($null -eq $TotalBytes -or $null -eq $AvailBytes -or [double]$TotalBytes -le 0) { return 'unknown' }
+    $th = $script:PLlmMemThresholds
+    $usedPct = 100.0 * ([double]$TotalBytes - [double]$AvailBytes) / [double]$TotalBytes
+    $availGb = [double]$AvailBytes / 1GB
+    $hp = 0.0; $hg = 0.0
+    $critHp = 0.0; $critHg = 0.0
+    if ($Previous -eq 'crit') { $critHp = $th.HystPct; $critHg = $th.HystGB }
+    if ($Previous -eq 'warn' -or $Previous -eq 'crit') { $hp = $th.HystPct; $hg = $th.HystGB }
+    if ($usedPct -ge ($th.CritUsedPct - $critHp) -or $availGb -lt ($th.CritAvailGB + $critHg)) { return 'crit' }
+    if ($usedPct -ge ($th.WarnUsedPct - $hp) -or $availGb -lt ($th.WarnAvailGB + $hg)) { return 'warn' }
+    return 'ok'
+}
+
+function Get-PLlmErrorHint {
+    # Maps a llama.cpp error line to one actionable sentence, or $null when there is nothing specific to say.
+    param([string]$Line)
+    if ([string]::IsNullOrEmpty($Line)) { return $null }
+    $rules = @(
+        @('couldn''t bind|failed to bind|address already in use|WSAEADDRINUSE', 'The port is already in use. Close the other Portable-LLM window or change PORT in CONFIG.bat.'),
+        @('out of memory|failed to allocate|unable to allocate|bad_alloc|ggml_aligned_malloc', 'Not enough memory. Close other programs, choose a smaller model or quantization, or lower CONTEXT in CONFIG.bat.'),
+        @('unknown model architecture', 'This llama.cpp build does not know this model type. Use a newer llama.cpp build or another model.'),
+        @('invalid magic|not a gguf|failed to read magic|gguf_init_from_file', 'The file is not a valid GGUF model (incomplete download?). Download it again.'),
+        @('failed to load model|error loading model', 'The model could not be loaded. Check that the file is complete and that enough RAM is free.')
+    )
+    foreach ($r in $rules) { if ($Line -match ('(?i)' + $r[0])) { return $r[1] } }
+    return $null
+}
+
+function Get-PLlmServerState {
+    # Pure state machine for the header.  Facts in, one of Starting | Loading Model | Ready | Error | Stopped out.
+    # HealthStatus is the last HTTP status code from GET /health ($null = never answered): 503 means llama.cpp is still
+    # loading; any other answer below 500 means the HTTP server is up and not reporting "loading".
+    param([bool]$Exited, [bool]$StoppedByUser, $ExitCode, $HealthStatus, [bool]$ListeningSeen, [bool]$LoaderSeen, [bool]$LogReady)
+    if ($Exited) {
+        if ($StoppedByUser -or $ExitCode -eq 0 -or $ExitCode -eq -1073741510) { return [pscustomobject]@{ State = 'Stopped'; Detail = 'server process has exited' } }
+        return [pscustomobject]@{ State = 'Error'; Detail = ('server process exited with code {0}' -f $ExitCode) }
+    }
+    if ($null -ne $HealthStatus) {
+        if ($HealthStatus -eq 503) { return [pscustomobject]@{ State = 'Loading Model'; Detail = 'server reports it is still loading the model' } }
+        if ($HealthStatus -ge 200 -and $HealthStatus -lt 500) { return [pscustomobject]@{ State = 'Ready'; Detail = 'server answers HTTP requests' } }
+    }
+    if ($LogReady) { return [pscustomobject]@{ State = 'Ready'; Detail = 'llama.cpp logged that the model is loaded' } }
+    if ($ListeningSeen) { return [pscustomobject]@{ State = 'Loading Model'; Detail = 'listening; waiting for readiness confirmation' } }
+    if ($LoaderSeen) { return [pscustomobject]@{ State = 'Loading Model'; Detail = 'reading model file' } }
+    return [pscustomobject]@{ State = 'Starting'; Detail = 'server process started' }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Local TCP helper (used by the launcher before start and by the monitor after stop)
+# ---------------------------------------------------------------------------------------------
+function Test-PLlmPortFree {
+    param([int]$Port)
+    try {
+        $l = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+        foreach ($e in $l) { if ($e.Port -eq $Port) { return $false } }
+    } catch { }
+    return $true
 }

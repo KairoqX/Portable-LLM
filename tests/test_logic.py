@@ -53,6 +53,19 @@ lb0 = RX['LoadBackend'].search(lines[0]); check('RPC backend line parsed as RPC 
 check('build line parsed', RX['BuildInfo'].search(lines[2]).group(1).startswith('10453 (3cb7ffb1a)'))
 check('listening line detected', RX['Listening'].search(lines[4]) is not None)
 check('CORS warning pattern matches the real string from llama-server-impl.dll', RX['CorsWarning'].search("CORS is set to allow all origins ('*') and no API key is set") is not None)
+# dashboard regexes (same strings the PowerShell dashboard uses)
+check('n_ctx is read from llama_context and from the new-slot line', RX['CtxReported'].search('llama_context: n_ctx         = 4096').group(1) == '4096' and RX['CtxReported'].search('slot   load_model: id  0 | task -1 | new slot, n_ctx = 8192').group(1) == '8192')
+check('n_ctx_seq is accepted, n_ctx_train is NOT mistaken for the context size', RX['CtxReported'].search('n_ctx_seq = 2048').group(1) == '2048' and RX['CtxReported'].search('print_info: n_ctx_train = 32768') is None)
+check('model-load start lines detected', all(RX['ModelLoadStart'].search(s) for s in ('srv    load_model: (startup) loading model C:\\m.gguf', 'llama_model_loader: loaded meta data', 'load_tensors: loading model tensors')))
+check('ready-by-log lines detected (and plain lines are not)', RX['ModelLoaded'].search('srv  update_slots: all slots are idle') and RX['ModelLoaded'].search('main: model loaded') and not RX['ModelLoaded'].search('srv  start: listening on http://127.0.0.1:8080'))
+check('error regex: real failures match, "error = 0" counters do not', RX['ErrorLine'].search("couldn't bind HTTP server socket") and RX['ErrorLine'].search('llama_model_load: error loading model: x') and RX['ErrorLine'].search('failed to allocate buffer') and not RX['ErrorLine'].search('stats: error = 0') and not RX['ErrorLine'].search('slot print_timing: id  0 | task 0 |'))
+check('warning regex', RX['WarnLine'].search('srv  warn: something') and not RX['WarnLine'].search('all slots are idle'))
+# memory thresholds mirror (Get-PLlmMemoryLevel, no hysteresis)
+def memlevel(total, avail):
+    used = 100.0 * (total - avail) / total; gb = avail / 2**30
+    return 'crit' if (used >= 95 or gb < 0.75) else 'warn' if (used >= 85 or gb < 1.5) else 'ok'
+G = 2**30
+check('memory levels: 4/8 GB free ok, 1.2 GB warn, 0.5 GB crit, 3.2 of 32 GB warn', [memlevel(8*G, 4*G), memlevel(8*G, 1.2*G), memlevel(8*G, .5*G), memlevel(32*G, 3.2*G)] == ['ok', 'warn', 'crit', 'warn'])
 # session aggregation (mirror of Get-PLlmSessionStats)
 reqs = [dict(pt=26, pms=828.71, gt=197, gms=26855.14), dict(pt=30, pms=866.5, gt=180, gms=22698.0)]
 gavg = sum(r['gt'] for r in reqs) * 1000 / sum(r['gms'] for r in reqs); pavg = sum(r['pt'] for r in reqs) * 1000 / sum(r['pms'] for r in reqs)
