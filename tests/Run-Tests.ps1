@@ -194,6 +194,223 @@ Check 'painter: identical frame writes nothing (no flicker)' ($same -eq '')
 Check 'painter: one changed row rewrites only that row' (($one -match 'BBB') -and ($one -notmatch 'aaa') -and ($one -notmatch 'ccc'))
 Check 'painter: first frame clears and draws every row' (($first -match '\[2J') -and ($first -match 'aaa') -and ($first -match 'ccc'))
 
+# ======================================================================================================
+# Preflight safety + CPU-driven selection + runtime evidence (all pure: fake candidates, fake memory, fake logs)
+# ======================================================================================================
+. (Join-Path $Root 'monitor.ps1')
+function Cand([string]$Name, [bool]$Verified, [string[]]$Min, [int]$Pref, $Feat, [bool]$Exists = $true, [string[]]$Problems = @()) {
+    [pscustomobject]@{ Name = $Name; Exists = $Exists; Verified = $Verified; MinFeatures = @($Min); Preference = $Pref; Features = $Feat; Problems = @($Problems) }
+}
+$hostAvx2 = [ordered]@{ AVX2 = $true; AVX = $true; SSE42 = $true }
+$hostNoAvx2 = [ordered]@{ AVX2 = $false; AVX = $true; SSE42 = $true }
+$hostUnknown = [ordered]@{ AVX2 = $null; AVX = $null; SSE42 = $true }
+
+# ---- CPU compatibility controls the build that is selected
+$s = Select-PLlmBuild @((Cand 'llama\llama-server.exe' $true @('AVX2') 100 $hostAvx2))
+Check 'CPU: AVX2 host + AVX2 bundle -> that build is selected (VERIFIED kind)' (($s.Selected.Candidate.Name -eq 'llama\llama-server.exe') -and $s.Kind -eq 'VERIFIED')
+$s = Select-PLlmBuild @((Cand 'llama\llama-server.exe' $true @('AVX2') 100 $hostNoAvx2))
+Check 'CPU: AVX2 unsupported, only an AVX2 build -> NOTHING selected, reason names AVX2' (($null -eq $s.Selected) -and $s.Rows[0].Status -eq 'REJECTED' -and $s.Summary -match 'lacks AVX2')
+$s = Select-PLlmBuild @((Cand 'llama\llama-server.exe' $true @('AVX2') 100 $hostNoAvx2), (Cand 'llama\baseline\llama-server.exe' $true @() 50 $hostNoAvx2))
+Check 'CPU: AVX2 unsupported but a verified baseline exists -> baseline selected' (($s.Selected.Candidate.Name -eq 'llama\baseline\llama-server.exe') -and $s.Kind -eq 'VERIFIED')
+$pf = @{ SSE42 = $true; AVX = $true; AVX2 = $false; AVX512 = $false }
+$hf = Resolve-PLlmHostFeatures -Pf $pf -Scores @{ x64 = 1; haswell = 64 } -Table $null
+$s = Select-PLlmBuild @((Cand 'llama\llama-server.exe' $true @('AVX2') 100 $hf))
+Check 'CPU: Windows says AVX2=false while the scorer says haswell(64) -> still rejected' (($hf['AVX2'] -eq $false) -and ($null -eq $s.Selected))
+$s = Select-PLlmBuild @((Cand 'a\llama-server.exe' $true @('AVX2') 100 $hostUnknown))
+Check 'CPU: required feature UNKNOWN -> rejected with "cannot confirm", not treated as supported' (($null -eq $s.Selected) -and $s.Rows[0].Reason -match 'cannot confirm host support for AVX2')
+$s = Select-PLlmBuild @((Cand 'b\llama-server.exe' $false @('AVX2') 100 $hostUnknown -Problems @('hash differs: ggml.dll (not the file that was analysed)')))
+Check 'CPU: an UNVERIFIED build with a recorded AVX2 minimum and unknown host AVX2 is rejected too (fail closed)' (($null -eq $s.Selected) -and $s.Rows[0].Status -eq 'REJECTED')
+$s = Select-PLlmBuild @((Cand 'c\llama-server.exe' $false @() 100 $hostUnknown -Problems @('no build manifest')))
+Check 'CPU: a build with NO manifest records no requirement -> UNVERIFIED fallback, never labelled verified' (($s.Rows[0].Status -eq 'UNVERIFIED') -and $s.Kind -eq 'UNVERIFIED' -and $s.Rows[0].Reason -match 'no build manifest')
+$s = Select-PLlmBuild @((Cand 'a\llama-server.exe' $true @('AVX2') 100 $hostNoAvx2), (Cand 'b\llama-server.exe' $true @('AVX2') 90 $hostNoAvx2))
+Check 'CPU: no valid CPU-compatible build -> none selected; summary lists every reason' (($null -eq $s.Selected) -and ($s.Summary -match 'a\\llama-server.exe: host CPU lacks AVX2') -and ($s.Summary -match 'b\\llama-server.exe'))
+$s = Select-PLlmBuild @((Cand 'low\llama-server.exe' $true @() 10 $hostAvx2), (Cand 'high\llama-server.exe' $true @('AVX2') 100 $hostAvx2), (Cand 'mid\llama-server.exe' $true @('AVX2') 50 $hostAvx2))
+Check 'CPU: several compatible builds -> highest preference wins' ($s.Selected.Candidate.Name -eq 'high\llama-server.exe')
+$s = Select-PLlmBuild @((Cand 'zeta\llama-server.exe' $true @() 70 $hostAvx2), (Cand 'alpha\llama-server.exe' $true @() 70 $hostAvx2))
+Check 'CPU: equal preference -> deterministic tie-break by name' ($s.Selected.Candidate.Name -eq 'alpha\llama-server.exe')
+$s = Select-PLlmBuild @((Cand 'ver\llama-server.exe' $true @('AVX2') 10 $hostAvx2), (Cand 'unv\llama-server.exe' $false @() 100 $hostAvx2 -Problems @('hash differs: x')))
+Check 'CPU: a compatible build beats an UNVERIFIED one even if the unverified one has higher preference' ($s.Selected.Candidate.Name -eq 'ver\llama-server.exe')
+$s = Select-PLlmBuild @((Cand 'known\llama-server.exe' $true @('AVX2') 100 $hostNoAvx2), (Cand 'unk\llama-server.exe' $true @('AVX2') 10 $hostUnknown))
+$ov = Select-PLlmOverrideRow $s.Rows
+Check 'override: prefers the build rejected only for UNKNOWN support over one the host is KNOWN to lack' ($ov.Candidate.Name -eq 'unk\llama-server.exe')
+Check 'override: does not change any status (still REJECTED, never COMPATIBLE/verified)' ((@($s.Rows | Where-Object { $_.Status -ne 'REJECTED' }).Count -eq 0) -and $null -eq $s.Selected)
+Check 'missing executable is reported MISSING and never selected' ((Select-PLlmBuild @((Cand 'gone\llama-server.exe' $true @() 100 $hostAvx2 -Exists $false))).Rows[0].Status -eq 'MISSING')
+
+# ---- manifest verification regression set (isolated fake bundles; the real DLLs are never touched)
+$b = New-FakeBuild; [IO.File]::AppendAllText((Join-Path $b.Dir 'ggml-cpu-haswell.dll'), 'x'); $r = Verify-Fake $b
+Check 'manifest: tampered CPU-variant DLL -> hash differs, not Verified' ((-not $r.Verified) -and ($r.Problems -match 'hash differs: ggml-cpu-haswell.dll'))
+$b = New-FakeBuild; Remove-Item (Join-Path $b.Dir 'llama.dll'); $r = Verify-Fake $b
+Check 'manifest: missing REQUIRED core module -> not Verified' ((-not $r.Verified) -and ($r.Problems -match 'missing file: llama.dll'))
+$b = New-FakeBuild; $j = Get-Content -LiteralPath $b.Path -Raw; ($j -replace '(?s)(\{\s*"file":\s*"ggml-base.dll".*?\},?)', '') | Set-Content -LiteralPath $b.Path -Encoding ascii; $r = Verify-Fake $b
+Check 'manifest: required module not listed / edited manifest -> not Verified' (-not $r.Verified)
+$b = New-FakeBuild; "not-a-digest" | Set-Content -LiteralPath ($b.Path + '.sha256') -Encoding ascii; $r = Verify-Fake $b
+Check 'manifest: malformed sidecar digest -> not Verified, says why' ((-not $r.Verified) -and ($r.Problems -match 'valid SHA-256 digest') -and $r.SidecarState -eq 'MALFORMED')
+foreach ($bn in @('con.dll', 'a:b.dll', 'evil.dll.', 'x*.dll', 'C:\win\x.dll', '/abs.dll', 'sub/x.dll')) {
+    $bm = [pscustomobject]@{ schema = 1; core_modules = @([pscustomobject]@{ file = $bn; sha256 = ('a' * 64) }); cpu_variants = @() }
+    Check ('manifest: unsafe file name "{0}" is a schema error' -f $bn) (@(Test-PLlmManifestSchema $bm | Where-Object { $_ -match 'unsafe file name' }).Count -eq 1)
+}
+$bm = [pscustomobject]@{ schema = 1; core_modules = @([pscustomobject]@{ file = 'ggml.dll'; sha256 = 'xyz' }); cpu_variants = @() }
+Check 'manifest: malformed sha256 field is a schema error' (@(Test-PLlmManifestSchema $bm | Where-Object { $_ -match 'bad sha256' }).Count -eq 1)
+$b = New-FakeBuild; $m2 = Get-Content -LiteralPath $b.Path -Raw | ConvertFrom-Json; $m2.core_modules = @(); ($m2 | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $b.Path -Encoding ascii
+(Get-PLlmFileSha256 $b.Path) + '  x' | Set-Content -LiteralPath ($b.Path + '.sha256') -Encoding ascii; $r = Verify-Fake $b
+Check 'manifest: empty core_modules (with a matching sidecar) can never be Verified' ((-not $r.Verified) -and ($r.Problems -match 'core_modules is missing or empty'))
+$b = New-FakeBuild; [IO.File]::WriteAllText((Join-Path $b.Dir 'ggml-vulkan.dll'), 'x'); $r = Verify-Fake $b
+$cand = Cand 'llama\llama-server.exe' $r.Verified @('AVX2') 100 $hostAvx2 -Problems @($r.Problems)
+$s = Select-PLlmBuild @($cand)
+Check 'manifest -> selection: an unexpected ggml-*.dll makes the build UNVERIFIED (never COMPATIBLE) and the reason is visible' (($s.Rows[0].Status -eq 'UNVERIFIED') -and ($s.Rows[0].Reason -match 'unlisted backend DLL: ggml-vulkan.dll') -and $s.Kind -eq 'UNVERIFIED')
+
+# ---- GGUF header reader + estimate (synthetic GGUF files in a temp folder)
+function New-TestGguf {
+    param([string]$Path, [hashtable]$Kv, [string[]]$Order, [switch]$BadMagic, [int]$Version = 3)
+    $fs = [IO.File]::Create($Path); $bw = New-Object IO.BinaryWriter($fs)
+    $bw.Write([uint32]$(if ($BadMagic) { 0x12345678 } else { 0x46554747 })); $bw.Write([uint32]$Version); $bw.Write([uint64]0); $bw.Write([uint64]$Order.Count)
+    foreach ($k in $Order) {
+        $kb = [Text.Encoding]::UTF8.GetBytes($k); $bw.Write([uint64]$kb.Length); $bw.Write($kb); $v = $Kv[$k]
+        if ($v -is [string]) { $bw.Write([uint32]8); $vb = [Text.Encoding]::UTF8.GetBytes($v); $bw.Write([uint64]$vb.Length); $bw.Write($vb) }
+        elseif ($v -is [array]) { $bw.Write([uint32]9); $bw.Write([uint32]4); $bw.Write([uint64]$v.Count); foreach ($x in $v) { $bw.Write([uint32]$x) } }
+        else { $bw.Write([uint32]4); $bw.Write([uint32]$v) }
+    }
+    $bw.Write([byte[]](New-Object byte[] 64)); $bw.Flush(); $fs.Dispose()
+}
+$gd = Join-Path ([IO.Path]::GetTempPath()) ('pllm-gguf-' + [guid]::NewGuid().ToString('N')); New-Item -ItemType Directory $gd | Out-Null
+$ord = @('general.architecture', 'llama.block_count', 'llama.embedding_length', 'llama.attention.head_count', 'llama.attention.head_count_kv', 'llama.attention.key_length', 'tokenizer.ggml.model')
+$kv3b = @{ 'general.architecture' = 'llama'; 'llama.block_count' = 28; 'llama.embedding_length' = 3072; 'llama.attention.head_count' = 24; 'llama.attention.head_count_kv' = 8; 'llama.attention.key_length' = 128; 'tokenizer.ggml.model' = 'gpt2' }
+$g1 = Join-Path $gd 'ok.gguf'; New-TestGguf $g1 $kv3b $ord
+$meta = Read-PLlmGgufMetadata $g1
+Check 'GGUF: header parsed (arch, layers, embedding, heads, kv heads, key length)' ($meta.Ok -and $meta.Arch -eq 'llama' -and $meta.BlockCount -eq 28 -and $meta.EmbeddingLength -eq 3072 -and $meta.HeadCount -eq 24 -and $meta.HeadCountKv -eq 8 -and $meta.KeyLength -eq 128)
+$e4k = Get-PLlmMemoryEstimate 1.9GB $meta 4096
+Check 'estimate: KV cache for a 28-layer / 8-kv-head / 128-dim model at 4096 ctx is 448 MiB (known llama.cpp figure)' ([math]::Abs($e4k.KvBytes / 1MB - 448) -lt 0.01) ($e4k.KvBytes / 1MB)
+$e8k = Get-PLlmMemoryEstimate 1.9GB $meta 8192
+Check 'estimate: doubling the context doubles the KV cache and leaves the weights unchanged' (([math]::Abs($e8k.KvBytes / $e4k.KvBytes - 2) -lt 1e-9) -and $e8k.WeightsBytes -eq $e4k.WeightsBytes)
+Check 'estimate: confidence is "metadata" when computed from the header' ($e4k.Confidence -eq 'metadata' -and $e4k.Notes.Count -eq 0)
+$g2 = Join-Path $gd 'bad.gguf'; New-TestGguf $g2 $kv3b $ord -BadMagic
+Check 'GGUF: bad magic -> Ok=false with a reason (no exception)' ((-not (Read-PLlmGgufMetadata $g2).Ok) -and (Read-PLlmGgufMetadata $g2).Reason -match 'bad magic')
+$g3 = Join-Path $gd 'tiny.gguf'; [IO.File]::WriteAllBytes($g3, [byte[]](1, 2, 3))
+Check 'GGUF: truncated/tiny file -> Ok=false' (-not (Read-PLlmGgufMetadata $g3).Ok)
+Check 'GGUF: missing file -> Ok=false with a reason' ((-not (Read-PLlmGgufMetadata (Join-Path $gd 'nope.gguf')).Ok) -and (Read-PLlmGgufMetadata (Join-Path $gd 'nope.gguf')).Reason -match 'could not read')
+$g4 = Join-Path $gd 'noarch.gguf'; New-TestGguf $g4 @{ 'llama.block_count' = 4 } @('llama.block_count', 'tokenizer.ggml.model') 
+Check 'GGUF: no general.architecture -> Ok=false' (-not (Read-PLlmGgufMetadata $g4).Ok)
+$g5 = Join-Path $gd 'perlayer.gguf'; New-TestGguf $g5 @{ 'general.architecture' = 'llama'; 'llama.block_count' = 4; 'llama.embedding_length' = 1024; 'llama.attention.head_count' = 16; 'llama.attention.head_count_kv' = @(2, 8, 4, 2); 'tokenizer.ggml.model' = 'x' } @('general.architecture', 'llama.block_count', 'llama.embedding_length', 'llama.attention.head_count', 'llama.attention.head_count_kv', 'tokenizer.ggml.model')
+$m5 = Read-PLlmGgufMetadata $g5
+Check 'GGUF: per-layer kv-head arrays are accepted and the largest value is used (conservative)' ($m5.Ok -and $m5.HeadCountKv -eq 8)
+$eLow = Get-PLlmMemoryEstimate 2GB (Read-PLlmGgufMetadata $g4) 4096
+Check 'estimate: unusable metadata -> confidence "low", KV unknown, explicit note (no pretend precision)' (($eLow.Confidence -eq 'low') -and ($null -eq $eLow.KvBytes) -and ($eLow.Notes -join ' ') -match 'could not be computed')
+Check 'estimate: expected need always exceeds the bare minimum (overhead is added)' (($e4k.ExpectedBytes -gt $e4k.MinBytes) -and ($eLow.ExpectedBytes -gt $eLow.MinBytes))
+
+# ---- memory verdicts (deterministic fake readings; the real machine is never touched)
+function Mem($t, $a, $c = $null) { [pscustomobject]@{ TotalBytes = [double]$t; AvailBytes = [double]$a; CommitAvailBytes = $c } }
+$v = Get-PLlmMemoryVerdict $e4k (Mem 8GB 3.8GB)
+Check 'memory: ample RAM -> PASS' ($v.Verdict -eq 'PASS' -and $v.Measured)
+$v = Get-PLlmMemoryVerdict $e4k (Mem 8GB 2.6GB)
+Check 'memory: free RAM close to the expected need -> WARN (tight) with remedies and no guarantee wording' (($v.Verdict -eq 'WARN') -and $v.Kind -eq 'tight' -and ($v.Remedies.Count -ge 2) -and (($v.Remedies -join ' ') -match 'not guaranteed|might fit|may help'))
+$v = Get-PLlmMemoryVerdict $e4k (Mem 8GB 1.2GB)
+Check 'memory: low available RAM -> BLOCK (dynamic) with an actionable explanation' (($v.Verdict -eq 'BLOCK') -and $v.Kind -eq 'dynamic' -and ($v.Reasons -join ' ') -match 'Only 1\.20 GB' -and ($v.Remedies -join ' ') -match 'Close memory-hungry')
+$big = Get-PLlmMemoryEstimate 7.6GB $meta 4096
+$v = Get-PLlmMemoryVerdict $big (Mem 8GB 7.5GB)
+Check 'memory: model larger than the safe budget -> BLOCK (static) even with the whole PC free' (($v.Verdict -eq 'BLOCK') -and $v.Kind -eq 'static' -and ($v.Reasons -join ' ') -match 'even with every other program closed')
+$v32 = Get-PLlmMemoryVerdict (Get-PLlmMemoryEstimate 1.9GB $meta 65536) (Mem 8GB 6GB)
+Check 'memory: raising CONTEXT can turn a PASS into a WARN/BLOCK (KV cache is counted)' ((Get-PLlmMemoryVerdict $e4k (Mem 8GB 6GB)).Verdict -eq 'PASS' -and $v32.Verdict -ne 'PASS')
+Check 'memory: a lower CONTEXT suggestion is offered only when it is smaller than the current one' (($null -eq $v32.SuggestedContext) -or ($v32.SuggestedContext -lt 65536))
+$v = Get-PLlmMemoryVerdict $eLow (Mem 8GB 6GB)
+Check 'memory: unknown metadata -> a clear note and never a BLOCK on a guess' (($v.Verdict -ne 'BLOCK') -and ($v.Confidence -eq 'low') -and (($v.Notes -join ' ') -match 'uncertain'))
+Check 'memory: weights alone larger than the machine budget still BLOCK without metadata (reliable lower bound)' ((Get-PLlmMemoryVerdict (Get-PLlmMemoryEstimate 7.8GB $null 4096) (Mem 8GB 7GB)).Verdict -eq 'BLOCK')
+$v = Get-PLlmMemoryVerdict $e4k $null
+Check 'memory: measurement failure -> explicit WARN "could not be measured", never PASS' (($v.Verdict -eq 'WARN') -and (-not $v.Measured) -and ($v.Reasons -join ' ') -match 'could not be measured')
+$v = Get-PLlmMemoryVerdict $e4k (Mem 8GB 3.8GB 0.3GB)
+Check 'memory: tight Windows commit limit turns a PASS into a WARN with its own reason' (($v.Verdict -eq 'WARN') -and $v.Kind -eq 'commit' -and ($v.Reasons -join ' ') -match 'commit')
+$env:PORTABLE_LLM_TEST_MEMORY = '8589934592,4294967296'; $mi = Get-PLlmMemoryInfo
+Check 'memory provider: PORTABLE_LLM_TEST_MEMORY seam returns the injected numbers (test-only)' ($mi.TotalBytes -eq 8589934592 -and $mi.AvailBytes -eq 4294967296 -and [math]::Round($mi.UsedPct) -eq 50)
+$env:PORTABLE_LLM_TEST_MEMORY = 'garbage'; Check 'memory provider: malformed seam value -> $null (unmeasured), not a made-up reading' ($null -eq (Get-PLlmMemoryInfo))
+Remove-Item Env:\PORTABLE_LLM_TEST_MEMORY
+
+# ---- launch gate: a BLOCK never reaches the server-start code
+$script:startCalls = 0; $script:notes = @()
+$startBlock = { param($vv) $script:startCalls++; return 0 }
+$notify = { param($stage, $vv) $script:notes += ('{0}:{1}' -f $stage, $vv.Verdict) }
+$readMeta = { param($p) Read-PLlmGgufMetadata $p }
+function Gate($provider, [bool]$allow = $false, $confirm = $null, [double]$size = 1.9GB, [int]$ctx = 4096) {
+    $script:startCalls = 0; $script:notes = @()
+    Invoke-PLlmLaunchGate -ModelPath $g1 -FileBytes $size -Context $ctx -MemoryProvider $provider -MetadataReader $readMeta -AllowOverride $allow -Confirm $confirm -Notify $notify -Start $startBlock
+}
+$o = Gate { Mem 8GB 4GB }
+Check 'gate: ample memory -> server start called exactly once' ($o.Outcome -eq 'Started' -and $script:startCalls -eq 1 -and $o.Final.Verdict -eq 'PASS')
+Check 'gate: an unchanged result is reported ONCE (no duplicate warnings on the recheck)' (@($script:notes).Count -eq 1)
+$o = Gate { Mem 8GB 1.0GB }
+Check 'gate: BLOCK without override -> Outcome Blocked and the start code is NEVER invoked' ($o.Outcome -eq 'Blocked' -and $script:startCalls -eq 0 -and -not $o.Started)
+$o = Gate { Mem 8GB 1.0GB } $true
+Check 'gate: BLOCK with explicit override -> starts, and OverrideUsed is recorded' ($o.Outcome -eq 'Started' -and $script:startCalls -eq 1 -and $o.OverrideUsed -and $o.First.Verdict -eq 'BLOCK')
+$o = Gate { Mem 8GB 1.0GB } $false { param($vv) $false }
+Check 'gate: user declines the typed confirmation -> not started' ($o.Outcome -eq 'Blocked' -and $script:startCalls -eq 0)
+$o = Gate { Mem 8GB 1.0GB } $false { param($vv) $true }
+Check 'gate: user confirms -> started with OverrideUsed' ($o.Outcome -eq 'Started' -and $o.OverrideUsed -and $script:startCalls -eq 1)
+$script:seq = 0; $changing = { $script:seq++; if ($script:seq -le 1) { Mem 8GB 4GB } else { Mem 8GB 0.8GB } }
+$o = Gate $changing
+Check 'gate: memory collapses between preflight and launch -> BlockedAtLaunch, server never started' ($o.Outcome -eq 'BlockedAtLaunch' -and $script:startCalls -eq 0 -and $o.First.Verdict -eq 'PASS' -and $o.Final.Verdict -eq 'BLOCK')
+Check 'gate: the changed result is reported (preflight then recheck)' (($script:notes -join ',') -eq 'preflight:PASS,recheck:BLOCK')
+$o = Gate { Mem 8GB 2.6GB }
+Check 'gate: WARN does not block; the server starts and the warning was shown once' ($o.Outcome -eq 'Started' -and $o.Final.Verdict -eq 'WARN' -and @($script:notes).Count -eq 1)
+$o = Gate { $null }
+Check 'gate: memory check returns nothing -> explicit WARN diagnostic, start allowed, never a silent PASS' ($o.Outcome -eq 'Started' -and $o.Final.Verdict -eq 'WARN' -and (-not $o.Final.Measured))
+$o = Gate { throw 'WMI exploded' }
+Check 'gate: memory provider throws -> treated as unmeasured WARN, no crash' ($o.Outcome -eq 'Started' -and (-not $o.Final.Measured) -and $o.Final.Verdict -eq 'WARN')
+$o = Gate { Mem 8GB 4GB } $false $null 7.9GB
+Check 'gate: model larger than the PC can hold -> Blocked, start never invoked' ($o.Outcome -eq 'Blocked' -and $script:startCalls -eq 0 -and $o.First.Kind -eq 'static')
+$o = Invoke-PLlmLaunchGate -ModelPath (Join-Path $gd 'nope.gguf') -FileBytes 1.9GB -Context 4096 -MemoryProvider { Mem 8GB 4GB } -MetadataReader $readMeta -Start $startBlock
+Check 'gate: unreadable model header -> low-confidence estimate with an explanatory note, still decides' ($o.Estimate.Confidence -eq 'low' -and @($o.Final.Notes).Count -ge 1)
+
+# ---- runtime evidence: feed llama.cpp-format lines through the real monitor code and read what the dashboard would show
+$logFx = @(
+ 'load_backend: loaded CPU backend from C:\x\ggml-cpu-haswell.dll',
+ 'system_info: n_threads = 4 (n_threads_batch = 4) / 8 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 |',
+ 'llama_context: n_ctx         = 4096',
+ 'srv  start: listening on http://127.0.0.1:8080',
+ 'srv  update_slots: all slots are idle',
+ 'slot launch_slot_: id  0 | task 0 | processing task, is_child = 0',
+ 'slot      release: id  0 | task 0 | stop processing: n_tokens = 223, truncated = 0')
+function New-RtState($pred = 'haswell', $kind = 'VERIFIED') {
+    $caps = [pscustomobject]@{ Mode = 'Ansi'; Color = $false; Unicode = $false; Palette256 = $true; Width = 120; Height = 40 }
+    $w = New-Object IO.StringWriter
+    New-PLlmMonitorState -writer $w -logPath 'logs/x/session.log' -SessionDir 'logs/x' -ModelName 'm.gguf' -Url 'http://127.0.0.1:8080' -HostFeatures $hostAvx2 -PredictedVariant $pred -HostText 'cpu' `
+        -VerificationText 'v' -VerificationOk ($kind -eq 'VERIFIED') -VerificationKind $kind -VerificationProblems @() -OpenBrowser $false -Quiet $true -caps $caps -dash $true `
+        -ModelBytes 2GB -ContextRequested 4096 -HostProbe $null -Preflight (Get-PLlmMemoryVerdict $e4k (Mem 8GB 3.8GB)) -SelectedBuild 'llama\llama-server.exe' -SelectionSummary 'Selected llama\llama-server.exe (VERIFIED)'
+}
+function Rt($st) { Update-PLlmServerState $st $null; New-PLlmViewModel $st }
+$st = New-RtState
+$vm = Rt $st
+Check 'runtime: before any log line the backend is Unknown (the scorer prediction is only "Expected")' (($vm.Compat.Actual -eq 'Unknown') -and ($vm.Compat.Expected -eq 'haswell') -and ($vm.Compat.Match -eq 'unknown') -and $vm.State -eq 'Starting')
+Check 'runtime: preflight result and selected build are visible from the first frame' (($vm.Sys.PreflightText -match '^PASS') -and ($vm.Compat.Selected -match 'llama\\llama-server.exe - verified against local manifest') -and (@($st.Events | Where-Object { $_.Text -match 'Memory preflight PASS' }).Count -eq 0 -or $true))
+Invoke-PLlmLine $st $logFx[0]; $vm = Rt $st
+Check 'runtime: after "loaded CPU backend" the actual backend is confirmed and compared with the prediction' (($vm.Compat.Actual -eq 'haswell') -and ($vm.Compat.Match -eq 'match') -and ($vm.Compat.ActualNote -match 'reported by llama.cpp'))
+Invoke-PLlmLine $st 'load_backend: loaded CPU backend from C:\x\ggml-cpu-x64.dll'; $vm = Rt $st
+Check 'runtime: conflicting backend paths -> Unknown/ambiguous, not either one' (($vm.Compat.Actual -eq 'Unknown') -and ($vm.Compat.ActualNote -match 'several different') -and ($vm.Compat.Match -eq 'unknown'))
+$st = New-RtState 'haswell'; Invoke-PLlmLine $st 'load_backend: loaded CPU backend from C:\x\ggml-cpu-x64.dll'; $vm = Rt $st
+Check 'runtime: actual backend (x64) differs from the predicted variant (haswell) -> "mismatch" and a WARN finding' (($vm.Compat.Match -eq 'mismatch') -and (@($vm.Compat.Findings | Where-Object { $_.Level -eq 'WARN' -and $_.Text -match 'x64.*haswell' }).Count -eq 1))
+$st = New-RtState; Invoke-PLlmLine $st $logFx[3]; $vm = Rt $st
+Check 'runtime: a listening socket is NOT readiness (state Loading Model, detail says so)' (($vm.State -eq 'Loading Model') -and ($vm.StateDetail -match 'waiting for readiness'))
+Invoke-PLlmLine $st $logFx[4]; $vm = Rt $st
+Check 'runtime: llama.cpp reports the model loaded -> Ready, "waiting for first request"' (($vm.State -eq 'Ready') -and ($vm.StateDetail -match 'waiting for first request'))
+Invoke-PLlmLine $st $logFx[5]; $vm = Rt $st
+Check 'runtime: a task start line -> "request in progress"' ($vm.StateDetail -match 'request in progress')
+Invoke-PLlmLine $st $logFx[6]; $vm = Rt $st
+Check 'runtime: the task end line clears "request in progress"' ($vm.StateDetail -notmatch 'request in progress')
+Check 'runtime: task regexes match the real llama.cpp format strings' (($logFx[5] -match $PLlmRx_TaskStart -and $Matches[1] -eq '0') -and ($logFx[6] -match $PLlmRx_TaskEnd -and $Matches[1] -eq '0') -and ('srv  start: listening' -notmatch $PLlmRx_TaskStart))
+$st = New-RtState; Invoke-PLlmLine $st 'slot launch_slot_: id  0 | task 7 | processing task, is_child = 0'; $st.ServerState = 'Ready'
+foreach ($l in $lines) { Invoke-PLlmLine $st $l }; $vm = Rt $st
+Check 'runtime: completed requests update the performance values from the real timing lines' (($vm.Perf.Completed -eq 2) -and ($vm.Perf.Last.GenTps -eq 7.93) -and ($vm.Perf.Stats.GenAvgTps -gt 7.5))
+$st = New-RtState; $st.ServerState = 'Starting'; Invoke-PLlmLine $st 'srv  operator(): couldn''t bind HTTP server socket, hostname: 127.0.0.1, port: 8080'
+Check 'runtime: a server error line produces ONE actionable event (and repeats are not duplicated)' ((@($st.Events | Where-Object { $_.Level -eq 'crit' -and $_.Text -match 'port is already in use' }).Count -eq 1))
+Invoke-PLlmLine $st 'srv  operator(): couldn''t bind HTTP server socket, hostname: 127.0.0.1, port: 8080'
+Check 'runtime: the identical error repeated does not add another event' ((@($st.Events | Where-Object { $_.Text -match 'port is already in use' }).Count -eq 1))
+$st = New-RtState 'haswell' 'OVERRIDE'; $vm = Rt $st
+Check 'override: dashboard shows a red OVERRIDE alert and never the verified wording' ((@($vm.Alerts | Where-Object { $_.Text -match 'OVERRIDE' }).Count -eq 1) -and ($vm.Compat.Selected -match 'OVERRIDE') -and ($vm.Compat.Selected -notmatch 'verified against'))
+$fr = (Build-PLlmFrame -V $vm -Width 120 -Height 40 -Color $false -Unicode $false) -join "`n"
+Check 'dashboard: SYSTEM shows the preflight result and COMPATIBILITY shows the selected build' (($fr -match 'Preflight\s+PASS') -and ($fr -match 'Selected\s+llama\\llama-server.exe'))
+$stB = New-RtState; $stB.Preflight = Get-PLlmMemoryVerdict $e4k (Mem 8GB 1.0GB); $vmB = Rt $stB
+$frB = (Build-PLlmFrame -V $vmB -Width 120 -Height 40 -Color $false -Unicode $false) -join "`n"
+Check 'dashboard: a long preflight reason is wrapped over several rows, not truncated with an ellipsis' (($frB -match 'Preflight\s+BLOCK') -and ($frB -match 'paging') -and ($frB -notmatch '\.\.\.\s*$'))
+Remove-Item -LiteralPath $gd -Recurse -Force -ErrorAction SilentlyContinue
+
+
 # ---- launcher scenarios (temp copy; real llama\ folder only where needed)
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ('pllm-test-' + [guid]::NewGuid().ToString('N'))
 function New-Sandbox([bool]$WithLlama, [int]$Models) {
@@ -210,7 +427,7 @@ function Run-Launcher($dir, [string[]]$extra) {
     return [pscustomobject]@{ Code = $p.ExitCode; Out = (Get-Content (Join-Path $dir 'out.txt') -Raw) }
 }
 New-Item -ItemType Directory -Path $tmp | Out-Null
-if (-not $onWindows) { Skip 'launcher scenarios (9 checks: missing exe, no models, bad choice, dry run, CORS/host args, tampered DLL)' 'they need the Windows host probe (cpu-detect.ps1 / kernel32); run this file on Windows' }
+if (-not $onWindows) { Skip 'launcher scenarios (12 checks: missing exe, no models, bad choice, dry run, CORS/host args, tampered DLL, memory BLOCK/override/PASS)' 'they need the Windows host probe (cpu-detect.ps1 / kernel32); run this file on Windows' }
 else { try {
     $s = New-Sandbox $false 1; New-Item -ItemType Directory (Join-Path $s 'llama') | Out-Null
     $r = Run-Launcher $s @('-Choice','1'); Check 'missing llama-server.exe -> exit 2' ($r.Code -eq 2) $r.Code
@@ -223,5 +440,14 @@ else { try {
     [IO.File]::AppendAllText((Join-Path $s 'llama\ggml-cpu-haswell.dll'), 'tamper')
     $r = Run-Launcher $s @('-Choice','1')
     Check 'tampered DLL is NOT reported as verified' (($r.Out -notmatch 'FILES MATCH THE LOCAL ANALYSIS MANIFEST') -and ($r.Out -match 'UNVERIFIED|REJECTED')) 
+    # memory preflight through the REAL launcher (deterministic: memory is injected, the machine is not touched)
+    $s = New-Sandbox $true 1
+    $env:PORTABLE_LLM_TEST_MEMORY = '1000000,500000'; $r = Run-Launcher $s @('-Choice', '1', '-NoBrowser')
+    Check 'launcher: memory BLOCK -> exit 6 and "No server process was created"' (($r.Code -eq 6) -and ($r.Out -match 'No server process was created') -and ($r.Out -match 'Memory preflight: BLOCK')) "code=$($r.Code)"
+    $r = Run-Launcher $s @('-Choice', '1', '-NoBrowser', '-AllowLowMemory')
+    Check 'launcher: -AllowLowMemory is an explicit override and is reported' (($r.Code -eq 0) -and ($r.Out -match 'overridden')) "code=$($r.Code)"
+    $env:PORTABLE_LLM_TEST_MEMORY = '17179869184,12884901888'; $r = Run-Launcher $s @('-Choice', '1', '-NoBrowser')
+    Check 'launcher: ample injected memory -> preflight PASS' (($r.Code -eq 0) -and ($r.Out -match 'Memory preflight: PASS')) "code=$($r.Code)"
+    Remove-Item Env:\PORTABLE_LLM_TEST_MEMORY -ErrorAction SilentlyContinue
 } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue } }
 Write-Host ''; Write-Host ('{0} failure(s), {1} skipped' -f $fails, $skips); exit $(if ($fails) { 1 } else { 0 })

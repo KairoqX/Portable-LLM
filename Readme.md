@@ -330,3 +330,7 @@ Details and limits: `docs/BUILD-EVIDENCE.md`. Test on Windows: `powershell -Exec
 While the server runs, the terminal shows a live status dashboard (server state, model, speeds, system, compatibility, recent
 activity). Keys: **O** open browser, **D** diagnostics, **L** log path, **R** redraw, **Q** stop and quit. Chatting happens in the
 browser only. Details, fallbacks and manual test steps: `docs/TUI.md`.
+
+## Safety checks before start
+The launcher refuses builds the CPU cannot run, and estimates memory before starting (PASS / WARN / BLOCK; a BLOCK exits with
+code 6 and starts nothing unless you explicitly override with `-AllowLowMemory`). See `docs/PREFLIGHT.md`.

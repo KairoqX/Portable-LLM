@@ -245,6 +245,14 @@ function Build-PLlmSystem {
         $lines += (Get-PLlmRow 'Server' $srv)
         $lines += (Get-PLlmRow 'Uptime' $up)
     }
+    if ($s.PSObject.Properties['PreflightText'] -and $s.PreflightText) {
+        # preflight reasons are wrapped, never cut: they explain a decision
+        $pw = @(Split-PLlmWrap $s.PreflightText ($W - 13)); $pr = Get-PLlmLevelRole $s.PreflightLevel
+        $nPf = $(if ($s.PreflightLevel -eq 'ok') { 2 } elseif ($Dense) { 3 } else { 7 })       # decisions that need action get room
+        if ($pw.Count -gt $nPf) { $pw = @($pw | Select-Object -First $nPf); $last = $pw[$nPf - 1]; if ($last.Length -gt ($W - 30)) { $last = $last.Substring(0, $W - 30) }; $pw[$nPf - 1] = $last + ' ... (D: full text)' }
+        $lines += ('  ' + (S 'gray' 'Preflight ') + (S $pr $pw[0]))          # 9-char label: needs its own separating space
+        for ($i = 1; $i -lt [math]::Min($nPf, $pw.Count); $i++) { $lines += ('            ' + (S $pr $pw[$i])) }
+    }
     return (New-PLlmSection 'System' 'blue' $W $lines)
 }
 
@@ -272,6 +280,11 @@ function Build-PLlmCompat {
         }
     }
     if (-not $Dense) { $lines += (Get-PLlmRow 'ISA used' (S 'gray' $c.Isa)) }
+    if ($c.PSObject.Properties['Selected'] -and $c.Selected) {
+        $sw = @(Split-PLlmWrap $c.Selected ($W - 12)); $sr = Get-PLlmLevelRole $c.SelectedLevel
+        $lines += (Get-PLlmRow 'Selected' (S $sr $sw[0]))
+        if (-not $Dense -and $sw.Count -gt 1) { $lines += ('           ' + (S $sr $sw[1])) }
+    }
     $iRole = Get-PLlmLevelRole $c.IntegrityLevel
     $iw = @(Split-PLlmWrap $c.IntegrityShort $room)
     $lines += (Get-PLlmRow 'Build' (S $iRole $iw[0]))

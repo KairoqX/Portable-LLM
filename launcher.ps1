@@ -4,16 +4,19 @@
 #   -DryRun            do every check and print the exact server command, but do not start the server
 #   -NoBrowser         do not open the browser when the server is ready
 #   -AllowUnverified   run a build even if its requirements are not met / not verified (also env PORTABLE_LLM_ALLOW_UNVERIFIED=1)
+#   -AllowLowMemory    start even when the memory preflight says BLOCK (also env PORTABLE_LLM_ALLOW_LOW_MEMORY=1); interactively you can instead type RUN ANYWAY
 #   -Root PATH         project folder (default: the folder containing this script)
 #
 # Exit codes:  0 ok | 1 unexpected error | 2 missing executable or models | 3 invalid model selection
 #              4 CPU/build compatibility rejected | 5 configuration rejected (non-local host, port busy)
+#              6 memory preflight BLOCKED the start (the server was not spawned)
 #              any other value = the exit code of llama-server itself
 param(
     [int]$Choice = 0,
     [switch]$DryRun,
     [switch]$NoBrowser,
     [switch]$AllowUnverified,
+    [switch]$AllowLowMemory,
     [string]$Root = ''
 )
 
@@ -132,7 +135,7 @@ function Invoke-PLlmMain {
             try { $manifest = Get-Content -LiteralPath $mPath -Raw | ConvertFrom-Json } catch { $mProblem = 'build-manifest.json is not valid JSON' }
         }
         $candidates += [pscustomobject]@{
-            Name = $exe.Substring($Root.Length).TrimStart('\'); Dir = $d; Path = $exe; Exists = $true
+            Name = $exe.Substring($Root.Length).TrimStart([char[]]@([char]92, [char]47)); Dir = $d; Path = $exe; Exists = $true
             Manifest = $manifest; ManifestProblem = $mProblem; Verified = $false; Problems = @(); MinFeatures = @(); Preference = 50
             Probe = $null; Features = $null; Predicted = $null
         }
@@ -177,19 +180,10 @@ function Invoke-PLlmMain {
         $c.Predicted = Get-PLlmPredictedVariant $scores
     }
 
-    # Selection needs per-candidate host features; evaluate each candidate against its own feature table.
-    $rows = @()
-    foreach ($c in $candidates) {
-        $one = Select-PLlmBuild -Candidates @($c) -HostFeatures $c.Features
-        $rows += $one.Rows[0]
-    }
-    $ok = @($rows | Where-Object { $_.Status -eq 'COMPATIBLE' } | Sort-Object { -[int]$_.Candidate.Preference })
-    $pick = $null; $kind = 'NONE'
-    if ($ok.Count -gt 0) { $pick = $ok[0]; $kind = 'VERIFIED' }
-    else {
-        $uv = @($rows | Where-Object { $_.Status -eq 'UNVERIFIED' })
-        if ($uv.Count -gt 0) { $pick = $uv[0]; $kind = 'UNVERIFIED' }
-    }
+    # One call to the tested, pure selection function; every candidate carries its own host-feature table.
+    $sel = Select-PLlmBuild -Candidates @($candidates)
+    $rows = @($sel.Rows)
+    $pick = $sel.Selected; $kind = $sel.Kind
 
     # ---- 3. report -------------------------------------------------------------------------------
     $hostData = $firstProbe
@@ -248,15 +242,20 @@ function Invoke-PLlmMain {
     $overridden = $false
     if (-not $pick) {
         $rej = @($rows | Where-Object { $_.Status -eq 'REJECTED' })
-        if ($rej.Count -gt 0 -and $allowOverride) {
-            $pick = $rej[0]; $kind = 'OVERRIDE'; $overridden = $true
+        $ovr = Select-PLlmOverrideRow $rows
+        if ($ovr -and $allowOverride) {
+            $pick = $ovr; $kind = 'OVERRIDE'; $overridden = $true
             Write-Rep ''
-            Write-Rep ' [WARN] Running a build that was REJECTED for this CPU because -AllowUnverified / PORTABLE_LLM_ALLOW_UNVERIFIED=1 is set.' 'Yellow'
-            Write-Rep '        If the server dies with "illegal instruction" (0xC000001D), this is why.' 'Yellow'
+            Write-Rep ' ################################################################################' 'Red'
+            Write-Rep (' # OVERRIDE: starting a build that was REJECTED for this CPU: {0}' -f $ovr.Candidate.Name) 'Red'
+            Write-Rep (' # Reason it was rejected: {0}' -f $ovr.Reason) 'Red'
+            Write-Rep ' # It is NOT verified as compatible. It may crash (illegal instruction 0xC000001D) or run wrongly.' 'Red'
+            Write-Rep ' ################################################################################' 'Red'
+            Write-Rep ' [WARN] The override is active because -AllowUnverified / PORTABLE_LLM_ALLOW_UNVERIFIED=1 is set.' 'Yellow'
         } else {
             Write-Rep ''
             Write-Rep ' [STOPPED] No build in the llama folder is known to be compatible with this CPU.' 'Red'
-            foreach ($r in $rej) { Write-Rep ('   Reason: {0}' -f $r.Reason) 'Red' }
+            Write-Rep ('   {0}' -f $sel.Summary) 'Red'
             Write-Rep '   Nothing was started, so you will not get a crash or a mysteriously slow run.' 'Red'
             Write-Rep '   Options: put a llama.cpp build compiled for older CPUs in llama\baseline\ (with its own build-manifest.json),' 'Red'
             Write-Rep '            or set PORTABLE_LLM_ALLOW_UNVERIFIED=1 to try the rejected build anyway (it may crash).' 'Red'
@@ -291,8 +290,6 @@ function Invoke-PLlmMain {
     $models = @(Get-ChildItem -LiteralPath $modelDir -Filter '*.gguf' -File -ErrorAction SilentlyContinue | Sort-Object Name)
     if ($models.Count -eq 0) { Stop-Launcher 2 ('No .gguf model files found in {0}' -f $modelDir) }
 
-    $freeGb = $null
-    try { $freeGb = (Get-CimInstance -ClassName Win32_OperatingSystem).FreePhysicalMemory / 1MB } catch { }
     Write-Host 'Available models:' -ForegroundColor White
     for ($i = 0; $i -lt $models.Count; $i++) {
         $sz = $models[$i].Length / 1GB
@@ -314,9 +311,6 @@ function Invoke-PLlmMain {
     }
     $modelGb = $picked.Length / 1GB
     Write-Rep ('Model: {0} ({1:N2} GB)' -f $picked.Name, $modelGb) 'White'
-    if ($null -ne $freeGb -and $modelGb -gt ($freeGb * 0.85)) {
-        Write-Rep ('[WARN] Only {0:N1} GB of RAM is free and this model is {1:N2} GB. Expect heavy paging/slowness; close other programs or pick a smaller model/quant.' -f $freeGb, $modelGb) 'Yellow'
-    }
 
     # ---- 5. command line -------------------------------------------------------------------------
     if (-not (Test-PLlmPortFree $port)) {
@@ -339,28 +333,63 @@ function Invoke-PLlmMain {
     $hostText = ('{0} | Windows API: {1}' -f $cpuName, $pfText)
     if ($chosen.Predicted) { $hostText += (' | scorer predicts: {0}' -f $chosen.Predicted) }
 
-    if ($DryRun) {
-        Write-Rep ''
-        Write-Rep '[DRY RUN] Everything above was checked; the server was NOT started.' 'Cyan'
-        exit 0
-    }
-
     $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
     $logRoot = Join-Path $Root 'logs'
     $sessionDir = Join-Path $logRoot $stamp
     $quiet = ($env:PORTABLE_LLM_QUIET -eq '1')
     $openBrowser = (-not $NoBrowser.IsPresent -and $env:PORTABLE_LLM_NO_BROWSER -ne '1')
-    Write-Rep ('Diagnostic log folder: {0}' -f $sessionDir) 'White'
-    Write-Rep 'Starting llama.cpp server - the dashboard opens next; the browser opens when the model has finished loading ...' 'White'
-    Write-Rep 'Dashboard keys: O open browser | D diagnostics | L log path | R redraw | Q stop server and quit.' 'White'
-    Write-Rep ''
+    $lowMemOverride = ($AllowLowMemory.IsPresent -or $env:PORTABLE_LLM_ALLOW_LOW_MEMORY -eq '1')
+    $interactive = ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected -and -not $DryRun)
 
-    $code = Invoke-PLlmServerMonitor -ServerExe $chosen.Path -ArgumentString $argText -WorkDir $chosen.Dir `
-        -SessionDir $sessionDir -ModelName $picked.Name -Url $url -Port $port -HostFeatures $chosen.Features `
-        -PredictedVariant $chosen.Predicted -HostText $hostText -VerificationText $verText -VerificationOk $verOk `
-        -HeaderLines @($script:Report) -OpenBrowser $openBrowser -Quiet $quiet `
-        -HostProbe $chosen.Probe -ModelBytes ([double]$picked.Length) -ContextRequested $ctx `
-        -VerificationKind $kind -VerificationProblems @($chosen.Problems)
+    # ---- 6. memory preflight + launch gate (the only path that can start the server) ---------------
+    Write-Rep ''
+    Write-Rep 'Memory preflight ...' 'White'
+    $notify = {
+        param($stage, $v)
+        $col = switch ($v.Verdict) { 'PASS' { 'Green' } 'WARN' { 'Yellow' } default { 'Red' } }
+        $head = ' Memory preflight: {0}' -f $v.Verdict
+        if ($stage -eq 'recheck') { $head = ' Memory CHANGED before launch; re-checked: {0}' -f $v.Verdict }
+        Write-Rep $head $col
+        foreach ($r in $v.Reasons) { Write-Rep ('   {0}' -f $r) $col }
+        foreach ($n in $v.Notes) { Write-Rep ('   Note: {0}' -f $n) 'DarkGray' }
+        if ($v.Verdict -ne 'PASS') { foreach ($m in $v.Remedies) { Write-Rep ('   - {0}' -f $m) $col } }
+        if ($v.Verdict -eq 'BLOCK') { Write-Rep '   The server was NOT started. (Override: -AllowLowMemory, or type RUN ANYWAY when asked. This can make the PC very slow or the server fail.)' 'Red' }
+    }
+    $confirm = {
+        param($v)
+        if (-not $interactive) { return $false }
+        $a = Read-Host ' To start anyway at your own risk type RUN ANYWAY (anything else cancels)'
+        return ($a -ceq 'RUN ANYWAY')
+    }
+    $start = {
+        param($pre)
+        if ($DryRun) {
+            Write-Rep ''
+            Write-Rep '[DRY RUN] Everything above was checked; the server was NOT started.' 'Cyan'
+            return 0
+        }
+        Write-Rep ('Diagnostic log folder: {0}' -f $sessionDir) 'White'
+        Write-Rep 'Starting llama.cpp server - the dashboard opens next; the browser opens when the model has finished loading ...' 'White'
+        Write-Rep 'Dashboard keys: O open browser | D diagnostics | L log path | R redraw | Q stop server and quit.' 'White'
+        Write-Rep ''
+        return (Invoke-PLlmServerMonitor -ServerExe $chosen.Path -ArgumentString $argText -WorkDir $chosen.Dir `
+            -SessionDir $sessionDir -ModelName $picked.Name -Url $url -Port $port -HostFeatures $chosen.Features `
+            -PredictedVariant $chosen.Predicted -HostText $hostText -VerificationText $verText -VerificationOk $verOk `
+            -HeaderLines @($script:Report) -OpenBrowser $openBrowser -Quiet $quiet `
+            -HostProbe $chosen.Probe -ModelBytes ([double]$picked.Length) -ContextRequested $ctx `
+            -VerificationKind $kind -VerificationProblems @($chosen.Problems) `
+            -Preflight $pre -SelectedBuild $chosen.Name -SelectionSummary $sel.Summary)
+    }
+    $gate = Invoke-PLlmLaunchGate -ModelPath $picked.FullName -FileBytes ([double]$picked.Length) -Context $ctx `
+        -MemoryProvider { Get-PLlmMemoryInfo } -MetadataReader { param($p) Read-PLlmGgufMetadata $p } `
+        -AllowOverride $lowMemOverride -Confirm $confirm -Notify $notify -Start $start
+    if (-not $gate.Started) {
+        Write-Rep ''
+        Write-Rep (' [STOPPED] Startup blocked by the memory preflight ({0}). No server process was created.' -f $gate.Outcome) 'Red'
+        exit 6
+    }
+    if ($gate.OverrideUsed) { Write-Host ' [WARN] Memory preflight was overridden; the server ran despite a BLOCK result.' -ForegroundColor Yellow }
+    $code = [int](@($gate.Result)[-1])
     if ($code -eq -1073741510) { exit 0 }
     exit $code
 }

@@ -177,6 +177,9 @@ function Invoke-PLlmLine {
         Add-PLlmEvent $State 'warn' 'Server reports permissive CORS; check --cors-origins'
     }
 
+    if ($Line -match $PLlmRx_TaskStart) { $State.ActiveTasks[$Matches[1]] = (Get-Date); $State.Dirty = $true }
+    elseif ($Line -match $PLlmRx_TaskEnd) { $State.ActiveTasks.Remove($Matches[1]); $State.Dirty = $true }
+
     if ($null -eq $State.BuildLine -and $Line -match $PLlmRx_BuildInfo) { $State.BuildLine = $Matches[1].Trim() }
     if ($null -eq $State.CtxReported -and $Line -match $PLlmRx_CtxReported) { $State.CtxReported = [int]$Matches[1] }
     if (-not $State.LoaderSeen -and $Line -match $PLlmRx_ModelLoadStart) { $State.LoaderSeen = $true; Add-PLlmEvent $State 'info' 'Loading model file' }
@@ -298,8 +301,8 @@ function Update-PLlmSystem {
         if ($lvl -ne $prev) {
             $State.MemLevel = $lvl
             $txt = ('{0} free, {1}% of RAM in use' -f (Format-PLlmBytes $m.AvailBytes), (Format-PLlmNumber $m.UsedPct '0'))
-            if ($lvl -eq 'crit') { Add-PLlmEvent $State 'crit' ('Memory critically low: ' + $txt) }
-            elseif ($lvl -eq 'warn') { Add-PLlmEvent $State 'warn' ('Memory low: ' + $txt) }
+            if ($lvl -eq 'crit') { Add-PLlmEvent $State 'crit' ('Memory critically low: ' + $txt + '. Running requests are not interrupted; close other programs or use a smaller model/context next time.') }
+            elseif ($lvl -eq 'warn') { Add-PLlmEvent $State 'warn' ('Memory low: ' + $txt + '. Close other memory-intensive programs if responses slow down.') }
             elseif ($prev -ne 'unknown') { Add-PLlmEvent $State 'ok' 'Memory pressure cleared' }
         }
     }
@@ -381,6 +384,24 @@ function New-PLlmViewModel {
     if ($State.MemLevel -eq 'crit' -and $mem) { $alerts += [pscustomobject]@{ Level = 'crit'; Text = ('Memory critically low: ' + (Format-PLlmBytes $mem.AvailBytes) + ' free.') } }
     elseif ($State.MemLevel -eq 'warn' -and $mem) { $alerts += [pscustomobject]@{ Level = 'warn'; Text = ('Memory low: ' + (Format-PLlmBytes $mem.AvailBytes) + ' free.') } }
 
+    $detail = $State.StateDetail
+    if ($State.ServerState -eq 'Ready') {
+        if ($State.ActiveTasks.Count -gt 0) { $detail = ('request in progress ({0} active)' -f $State.ActiveTasks.Count) }
+        elseif ($stats.Requests -eq 0) { $detail = 'ready - waiting for first request' }
+        else { $detail = 'ready - idle, last request completed' }
+    }
+    $pfText = ''; $pfLevel = 'unknown'
+    if ($State.Preflight) {
+        $pfLevel = switch ($State.Preflight.Verdict) { 'PASS' { 'ok' } 'WARN' { 'warn' } default { 'crit' } }
+        $pfText = ('{0}: {1}' -f $State.Preflight.Verdict, $(if (@($State.Preflight.Reasons).Count) { @($State.Preflight.Reasons)[0] } else { '' }))
+    }
+    $selText = ''; if ($State.SelectedBuild) { $selText = ('{0} - {1}' -f $State.SelectedBuild, $(if ($State.VerificationKind -eq 'VERIFIED') { 'verified against local manifest' } elseif ($State.VerificationKind -eq 'OVERRIDE') { 'OVERRIDE (rejected for this CPU)' } else { 'UNVERIFIED' })) }
+    $sys | Add-Member -NotePropertyName PreflightText -NotePropertyValue $pfText
+    $sys | Add-Member -NotePropertyName PreflightLevel -NotePropertyValue $pfLevel
+    $compat | Add-Member -NotePropertyName Selected -NotePropertyValue $selText
+    $compat | Add-Member -NotePropertyName SelectedLevel -NotePropertyValue $(if ($State.VerificationKind -eq 'VERIFIED') { 'info' } elseif ($State.VerificationKind -eq 'OVERRIDE') { 'crit' } else { 'warn' })
+    if ($State.VerificationKind -eq 'OVERRIDE') { $alerts += [pscustomobject]@{ Level = 'crit'; Text = 'OVERRIDE: running a build that was rejected for this CPU; it may crash.' } }
+
     $notice = $null
     if ($State.Notice) {
         if ((Get-Date) -lt $State.NoticeUntil) { $notice = $State.Notice } else { $State.Notice = $null; $State.Dirty = $true }   # expired: clear once, redraw once
@@ -391,7 +412,7 @@ function New-PLlmViewModel {
     $nShow = 5
     $evAll = @($State.Events)
     return [pscustomobject]@{
-        Version = $script:PLlmVersion; State = $State.ServerState; StateDetail = $State.StateDetail; Url = $State.Url
+        Version = $script:PLlmVersion; State = $State.ServerState; StateDetail = $detail; Url = $State.Url
         Alerts = $alerts; Model = $model; Perf = $perf; Sys = $sys; Compat = $compat
         Events = $evAll; Notice = $notice; ShowDiag = $State.ShowDiag; Diag = $diag
     }
@@ -406,6 +427,15 @@ function Get-PLlmDiagRows {
     if ($State.SysInfo -and $null -ne $State.SysInfo.Threads) { Add-D 'Threads' ([string]$State.SysInfo.Threads) }
     Add-D 'Integrity' $State.VerificationText $(if ($State.VerificationOk) { 'info' } else { 'warn' })
     foreach ($p in @($State.VerificationProblems | Select-Object -First 6)) { Add-D 'Problem' $p 'warn' }
+    if ($State.SelectionSummary) { Add-D 'Selection' $State.SelectionSummary }
+    if ($State.Preflight) {
+        $pv = $State.Preflight
+        Add-D 'Preflight' ('{0}; est. min {1}, expected {2} ({3}); RAM {4} free of {5}' -f $pv.Verdict, (Format-PLlmBytes $pv.MinBytes), (Format-PLlmBytes $pv.ExpectedBytes), $pv.Confidence, $(if ($pv.Measured) { Format-PLlmBytes $pv.AvailBytes } else { 'unmeasured' }), $(if ($pv.Measured) { Format-PLlmBytes $pv.TotalBytes } else { 'unmeasured' })) $(if ($pv.Verdict -eq 'PASS') { 'info' } elseif ($pv.Verdict -eq 'WARN') { 'warn' } else { 'crit' })
+        $pvl = $(if ($pv.Verdict -eq 'PASS') { 'info' } elseif ($pv.Verdict -eq 'WARN') { 'warn' } else { 'crit' })
+        foreach ($rs in @($pv.Reasons)) { Add-D 'Why' $rs $pvl }
+        foreach ($rm in @($pv.Remedies)) { Add-D 'Remedy' $rm $pvl }
+        foreach ($nt in @($pv.Notes)) { Add-D 'Estimate' $nt 'warn' }
+    }
     Add-D 'Host' $State.HostText
     if ($State.HostProbe -and $State.HostProbe.Ok -and $State.HostProbe.Data.scorer.available) {
         $sc = @(); foreach ($pp in $State.HostProbe.Data.scorer.scores.PSObject.Properties) { $sc += ('{0}={1}' -f $pp.Name, $pp.Value) }
@@ -485,27 +515,12 @@ function Test-PLlmTcpPort {
     } catch { return $false } finally { $c.Close() }
 }
 
-function Invoke-PLlmServerMonitor {
-    # Returns the server's exit code (or -1 if it could not be started).  0 when the user quit with Q / Ctrl+C in the dashboard.
-    param(
-        [string]$ServerExe, [string]$ArgumentString, [string]$WorkDir,
-        [string]$SessionDir, [string]$ModelName, [string]$Url, [int]$Port,
-        $HostFeatures, [string]$PredictedVariant, [string]$HostText,
-        [string]$VerificationText, [bool]$VerificationOk,
-        [string[]]$HeaderLines, [bool]$OpenBrowser, [bool]$Quiet,
-        $HostProbe = $null, [double]$ModelBytes = 0, [int]$ContextRequested = 0,
-        [string]$VerificationKind = '', $VerificationProblems = @()
-    )
-    New-Item -ItemType Directory -Path $SessionDir -Force | Out-Null
-    $logPath    = Join-Path $SessionDir 'session.log'
-    $outFile    = Join-Path $SessionDir 'server.stdout.txt'
-    $errFile    = Join-Path $SessionDir 'server.stderr.txt'
-    $writer = New-Object System.IO.StreamWriter($logPath, $false, (New-Object System.Text.UTF8Encoding($false)))
-    $writer.AutoFlush = $true
-    if (-not $VerificationKind) { $VerificationKind = $(if ($VerificationOk) { 'VERIFIED' } else { 'UNVERIFIED' }) }
-    $caps = Get-PLlmTermCaps
-    $dash = ($caps.Mode -ne 'Log')
-    $st = [pscustomobject]@{
+function New-PLlmMonitorState {
+    # All monitor state in one object (tests build it directly and feed log lines through Invoke-PLlmLine).
+    param($writer, [string]$logPath, [string]$SessionDir, [string]$ModelName, [string]$Url, $HostFeatures, [string]$PredictedVariant, [string]$HostText,
+          [string]$VerificationText, [bool]$VerificationOk, [string]$VerificationKind, $VerificationProblems, [bool]$OpenBrowser, [bool]$Quiet,
+          $caps, [bool]$dash, [double]$ModelBytes, [int]$ContextRequested, $HostProbe, $Preflight, [string]$SelectedBuild, [string]$SelectionSummary)
+    return [pscustomobject]@{
         Log = $writer; LogPath = $logPath; CsvPath = (Join-Path $SessionDir 'requests.csv'); LatestPath = (Join-Path (Split-Path -Parent $SessionDir) 'latest-summary.txt')
         Session = (New-PLlmSession); LastRequest = $null; LastLines = (New-Object System.Collections.ArrayList)
         Backend = $null; BackendAmbiguous = $false; CpuBackendsSeen = (New-Object System.Collections.ArrayList); FindingsShown = $false; SysInfo = $null; BuildLine = $null; OtherBackends = @(); Ready = $false; FirstRequestChecked = $false; CorsWarned = $false
@@ -522,8 +537,44 @@ function Invoke-PLlmServerMonitor {
         Health = [pscustomobject]@{ Req = $null; Async = $null; Started = $null; Status = $null; At = $null; LastError = '' }
         Mem = $null; MemLevel = 'unknown'; ProcMem = $null; Pid = $null; GuardOk = $false; GuardReason = 'not started'
         Notice = $null; NoticeUntil = [datetime]::MinValue; LastOpen = $null; LogArmedUntil = $null
+        Preflight = $Preflight; SelectedBuild = $SelectedBuild; SelectionSummary = $SelectionSummary; ActiveTasks = @{}
     }
+}
+
+function Invoke-PLlmServerMonitor {
+    # Returns the server's exit code (or -1 if it could not be started).  0 when the user quit with Q / Ctrl+C in the dashboard.
+    param(
+        [string]$ServerExe, [string]$ArgumentString, [string]$WorkDir,
+        [string]$SessionDir, [string]$ModelName, [string]$Url, [int]$Port,
+        $HostFeatures, [string]$PredictedVariant, [string]$HostText,
+        [string]$VerificationText, [bool]$VerificationOk,
+        [string[]]$HeaderLines, [bool]$OpenBrowser, [bool]$Quiet,
+        $HostProbe = $null, [double]$ModelBytes = 0, [int]$ContextRequested = 0,
+        [string]$VerificationKind = '', $VerificationProblems = @(),
+        $Preflight = $null, [string]$SelectedBuild = '', [string]$SelectionSummary = ''
+    )
+    New-Item -ItemType Directory -Path $SessionDir -Force | Out-Null
+    $logPath    = Join-Path $SessionDir 'session.log'
+    $outFile    = Join-Path $SessionDir 'server.stdout.txt'
+    $errFile    = Join-Path $SessionDir 'server.stderr.txt'
+    $writer = New-Object System.IO.StreamWriter($logPath, $false, (New-Object System.Text.UTF8Encoding($false)))
+    $writer.AutoFlush = $true
+    if (-not $VerificationKind) { $VerificationKind = $(if ($VerificationOk) { 'VERIFIED' } else { 'UNVERIFIED' }) }
+    $caps = Get-PLlmTermCaps
+    $dash = ($caps.Mode -ne 'Log')
+    $st = New-PLlmMonitorState -writer $writer -logPath $logPath -SessionDir $SessionDir -ModelName $ModelName -Url $Url -HostFeatures $HostFeatures -PredictedVariant $PredictedVariant -HostText $HostText `
+        -VerificationText $VerificationText -VerificationOk $VerificationOk -VerificationKind $VerificationKind -VerificationProblems $VerificationProblems -OpenBrowser $OpenBrowser -Quiet $Quiet `
+        -caps $caps -dash $dash -ModelBytes $ModelBytes -ContextRequested $ContextRequested -HostProbe $HostProbe -Preflight $Preflight -SelectedBuild $SelectedBuild -SelectionSummary $SelectionSummary
     foreach ($h in $HeaderLines) { Write-PLlmOut $st $h 'Gray' -LogOnly }
+    # decisions made before the server existed become the first activity entries
+    if ($Preflight) {
+        $plv = switch ($Preflight.Verdict) { 'PASS' { 'ok' } 'WARN' { 'warn' } default { 'crit' } }
+        Add-PLlmEvent $st $plv ('Memory preflight {0}: {1}' -f $Preflight.Verdict, $(if (@($Preflight.Reasons).Count) { @($Preflight.Reasons)[0] } else { 'no detail' }))
+    }
+    if ($SelectedBuild) {
+        $blv = 'info'; if ($VerificationKind -ne 'VERIFIED') { $blv = 'warn' }
+        Add-PLlmEvent $st $blv ('Build selected: {0} ({1})' -f $SelectedBuild, $(if ($VerificationKind -eq 'VERIFIED') { 'files match local manifest; host meets its minimum' } elseif ($VerificationKind -eq 'OVERRIDE') { 'OVERRIDE: rejected for this CPU, not verified compatible' } else { 'UNVERIFIED' }))
+    }
     Write-PLlmOut $st ('Display mode: {0} (color={1}, unicode={2}){3}' -f $caps.Mode, $caps.Color, $caps.Unicode, $(if ($caps.Why) { ' - ' + $caps.Why } else { '' })) 'Gray' -LogOnly
     Write-PLlmOut $st '--- server output follows ---' 'DarkGray' -LogOnly
 
@@ -610,6 +661,7 @@ function Invoke-PLlmServerMonitor {
         if ($tailErr) { $tailErr.Reader.Dispose(); $tailErr.Stream.Dispose() }
         if ($st.Health.Req) { try { $st.Health.Req.Abort() } catch { } }
         Close-PLlmSession $st.Session
+        $st.ActiveTasks.Clear()
         if ($screenOn) { try { Exit-PLlmScreen $caps } catch { } }
         Close-PLlmProcessGuard $guard
         $st.Echo = $true

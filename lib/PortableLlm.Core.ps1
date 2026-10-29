@@ -41,6 +41,11 @@ $PLlmRx_ErrorLine = '(?i)\b(?:error|fatal|exception)\b(?!\s*=\s*0)|\bfailed to\b
 # REGEX:WarnLine
 $PLlmRx_WarnLine = '(?i)\bwarn(?:ing)?\b'
 
+# REGEX:TaskStart
+$PLlmRx_TaskStart = 'task\s+(-?\d+)\s*\|\s*processing task'
+# REGEX:TaskEnd
+$PLlmRx_TaskEnd = 'task\s+(-?\d+)\s*\|\s*stop processing'
+
 # Shown in the dashboard header.  Change it here only.
 $script:PLlmVersion = '2.1'
 
@@ -366,7 +371,7 @@ function Test-PLlmManifestSchema {
     foreach ($e in ($core + $vars)) {
         if ($null -eq $e -or [string]::IsNullOrEmpty([string]$e.file)) { [void]$errs.Add('entry without a file name'); continue }
         $f = [string]$e.file
-        if ($f -match '[\\/:]' -or $f -eq '.' -or $f -eq '..' -or $f.Contains('..')) { [void]$errs.Add(('unsafe file name in manifest: {0}' -f $f)) }
+        if ($f -match '[\\/:*?"<>|]' -or $f -eq '.' -or $f -eq '..' -or $f.Contains('..') -or $f -match '[. ]$' -or $f -match '^(?i)(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$') { [void]$errs.Add(('unsafe file name in manifest: {0}' -f $f)) }
         if (([string]$e.sha256) -notmatch '^[0-9a-fA-F]{64}$') { [void]$errs.Add(('bad sha256 for {0}' -f $f)) }
         if ($names.ContainsKey($f.ToLowerInvariant())) { [void]$errs.Add(('duplicate entry: {0}' -f $f)) }
         $names[$f.ToLowerInvariant()] = $true
@@ -395,7 +400,8 @@ function Test-PLlmManifest {
         if (Test-Path -LiteralPath $side) {
             $want = ((Get-Content -LiteralPath $side -Raw) -split '\s+')[0].Trim().ToLowerInvariant()
             $have = (& $HashFunction $ManifestPath)
-            if ($want -eq $have) { $sidecarState = 'matches' } else { $sidecarState = 'MISMATCH'; [void]$problems.Add('manifest does not match build-manifest.json.sha256 (edited or corrupted)') }
+            if ($want -notmatch '^[0-9a-f]{64}$') { $sidecarState = 'MALFORMED'; [void]$problems.Add('build-manifest.json.sha256 does not contain a valid SHA-256 digest') }
+            elseif ($want -eq $have) { $sidecarState = 'matches' } else { $sidecarState = 'MISMATCH'; [void]$problems.Add('manifest does not match build-manifest.json.sha256 (edited or corrupted)') }
         } else { [void]$problems.Add('no build-manifest.json.sha256 sidecar (manifest integrity unchecked)') }
     }
     if ($problems.Count -eq 0 -or $Manifest) {
@@ -420,46 +426,61 @@ function Test-PLlmManifest {
 }
 
 function Select-PLlmBuild {
-    # Pure selection logic.
-    #   Candidates: objects with Path, Exists, Manifest ($null if none), Verified, Problems, MinFeatures, Preference
-    #   HostFeatures: ordered table feature -> $true/$false/$null
+    # Pure, deterministic selection.
+    #   Candidates: objects with Name, Exists, Verified, Problems, MinFeatures, Preference and (optionally) Features, the
+    #               candidate's own host-feature table. HostFeatures is used for candidates that carry no table.
+    #   Features:   ordered table feature -> $true / $false / $null (unknown). Unknown is NEVER treated as supported.
     # Rules:
-    #   1. A verified candidate whose every required feature is $true on the host is "compatible". Highest Preference wins.
-    #   2. Otherwise an UNVERIFIED candidate is used as a fallback (flagged UNVERIFIED), never reported as verified.
-    #   3. Verified-but-incompatible candidates are never selected here (the caller decides about an explicit override).
+    #   1. COMPATIBLE = manifest verified AND every recorded minimum feature is confirmed $true on this host.
+    #   2. A recorded minimum that the host lacks ($false) or cannot confirm ($null) -> REJECTED. This applies to
+    #      unverified builds too whenever a structurally valid manifest recorded a minimum (fail closed).
+    #   3. UNVERIFIED (no manifest, or files differ from it) is only a fallback when nothing is COMPATIBLE.
+    #      A build with no manifest has NO recorded requirements; that is stated, never guessed from file names.
+    #   4. Among COMPATIBLE builds: highest Preference, then Name (deterministic; Sort-Object alone is not stable in WinPS 5.1).
     param($Candidates, $HostFeatures)
     $rows = @()
     foreach ($c in $Candidates) {
-        $status = ''; $reason = ''
+        $status = ''; $reason = ''; $missing = @(); $unknown = @()
+        $feat = $HostFeatures
+        if ($c.PSObject.Properties['Features'] -and $c.Features) { $feat = $c.Features }
         if (-not $c.Exists) { $status = 'MISSING'; $reason = 'executable not found' }
         else {
-            $missing = @(); $unknown = @()
             foreach ($f in @($c.MinFeatures)) {
                 if ([string]::IsNullOrEmpty($f)) { continue }
                 $have = $null
-                if ($HostFeatures -and $HostFeatures.Contains($f)) { $have = $HostFeatures[$f] }
+                if ($feat -and $feat.Contains($f)) { $have = $feat[$f] }
                 if ($have -eq $false) { $missing += $f } elseif ($null -eq $have) { $unknown += $f }
             }
-            if ($c.Verified) {
-                if ($missing.Count -gt 0) { $status = 'REJECTED'; $reason = ('host CPU lacks ' + ($missing -join ', ') + ' required by this build') }
-                elseif ($unknown.Count -gt 0) { $status = 'REJECTED'; $reason = ('cannot confirm host support for ' + ($unknown -join ', ')) }
-                else { $status = 'COMPATIBLE'; $reason = 'files match the local manifest; host meets its recorded minimum' }
-            } else {
+            if ($missing.Count -gt 0) { $status = 'REJECTED'; $reason = ('host CPU lacks ' + ($missing -join ', ') + ' required by this build') }
+            elseif ($unknown.Count -gt 0) { $status = 'REJECTED'; $reason = ('cannot confirm host support for ' + ($unknown -join ', ') + ', which this build requires (unknown is not treated as supported)') }
+            elseif ($c.Verified) { $status = 'COMPATIBLE'; $reason = 'files match the local manifest; host meets its recorded minimum' }
+            else {
                 $status = 'UNVERIFIED'
                 if ($c.Problems -and @($c.Problems).Count -gt 0) { $reason = (@($c.Problems)[0]) } else { $reason = 'no build manifest; compile-time ISA unknown' }
-                if ($missing.Count -gt 0) { $status = 'REJECTED'; $reason = ('host CPU lacks ' + ($missing -join ', ')) }
             }
         }
-        $rows += [pscustomobject]@{ Candidate = $c; Status = $status; Reason = $reason }
+        $rows += [pscustomobject]@{ Candidate = $c; Status = $status; Reason = $reason; Missing = @($missing); Unknown = @($unknown) }
     }
     $pick = $null; $pickKind = 'NONE'
-    $ok = @($rows | Where-Object { $_.Status -eq 'COMPATIBLE' } | Sort-Object { -[int]$_.Candidate.Preference })
+    $ok = @($rows | Where-Object { $_.Status -eq 'COMPATIBLE' } | Sort-Object @{ Expression = { -[int]$_.Candidate.Preference } }, @{ Expression = { [string]$_.Candidate.Name } })
     if ($ok.Count -gt 0) { $pick = $ok[0]; $pickKind = 'VERIFIED' }
     else {
-        $uv = @($rows | Where-Object { $_.Status -eq 'UNVERIFIED' })
+        $uv = @($rows | Where-Object { $_.Status -eq 'UNVERIFIED' } | Sort-Object @{ Expression = { -[int]$_.Candidate.Preference } }, @{ Expression = { [string]$_.Candidate.Name } })
         if ($uv.Count -gt 0) { $pick = $uv[0]; $pickKind = 'UNVERIFIED' }
     }
-    return [pscustomobject]@{ Rows = $rows; Selected = $pick; Kind = $pickKind }
+    $summary = ''
+    if ($pick) { $summary = ('Selected {0} ({1}): {2}' -f $pick.Candidate.Name, $pickKind, $pick.Reason) }
+    else { $summary = 'No build can be started: ' + ((@($rows | ForEach-Object { '{0}: {1}' -f $_.Candidate.Name, $_.Reason })) -join '; ') }
+    return [pscustomobject]@{ Rows = $rows; Selected = $pick; Kind = $pickKind; Summary = $summary }
+}
+
+function Select-PLlmOverrideRow {
+    # Only used when the user explicitly overrides.  Never changes a status; just picks the least risky rejected build:
+    # one rejected only because support is UNKNOWN beats one the host is KNOWN to lack; then Preference, then Name.
+    param($Rows)
+    $rej = @($Rows | Where-Object { $_.Status -eq 'REJECTED' })
+    if ($rej.Count -eq 0) { return $null }
+    return @($rej | Sort-Object @{ Expression = { @($_.Missing).Count } }, @{ Expression = { -[int]$_.Candidate.Preference } }, @{ Expression = { [string]$_.Candidate.Name } })[0]
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -589,4 +610,223 @@ function Test-PLlmPortFree {
         foreach ($e in $l) { if ($e.Port -eq $Port) { return $false } }
     } catch { }
     return $true
+}
+
+# ---------------------------------------------------------------------------------------------
+# Memory preflight (pure; every external fact comes in through a parameter or an injectable scriptblock)
+# ---------------------------------------------------------------------------------------------
+# Policy constants.  These are HEURISTICS, documented in docs/PREFLIGHT.md; nothing here claims an exact peak.
+$script:PLlmMemPolicy = @{
+    OverheadFixedBytes      = 512MB     # compute buffers, graph, tokenizer, server and runtime allocations
+    OverheadWeightFraction  = 0.03      # plus this fraction of the weights
+    UnknownKvFractionPer4096 = 0.20     # KV guess (fraction of weights per 4096 ctx) ONLY when GGUF metadata is unusable
+    KvBytesPerElement       = 2.0       # f16 cache (llama-server default)
+    OsReserveMinBytes       = 1GB       # kept for Windows and other programs when judging what can EVER fit
+    OsReserveFraction       = 0.10
+    HeadroomMinBytes        = 512MB     # extra free RAM wanted on top of the expected need before we say PASS
+    HeadroomFraction        = 0.05
+    BlockAvailFraction      = 0.75      # BLOCK when free RAM is below this fraction of (weights + KV), the bare minimum
+}
+
+function Read-PLlmGgufMetadata {
+    # Reads ONLY the GGUF header key/value section (never the tensors) and stops at the first tokenizer.* key, so a
+    # multi-GB model costs a few KB of reads.  Never throws; Ok = $false with a Reason when the file is not usable.
+    param([string]$Path)
+    $res = [pscustomobject]@{ Ok = $false; Reason = ''; Version = $null; Arch = $null; BlockCount = $null; EmbeddingLength = $null
+                              HeadCount = $null; HeadCountKv = $null; KeyLength = $null; ValueLength = $null; ContextLength = $null }
+    $fs = $null
+    try {
+        $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $br = New-Object System.IO.BinaryReader($fs)
+        $len = $fs.Length
+        if ($len -lt 24) { $res.Reason = 'file too small to be a GGUF model'; return $res }
+        if ($br.ReadUInt32() -ne 0x46554747) { $res.Reason = 'not a GGUF file (bad magic)'; return $res }
+        $ver = $br.ReadUInt32(); $res.Version = $ver
+        if ($ver -lt 2 -or $ver -gt 3) { $res.Reason = ('unsupported GGUF version {0}' -f $ver); return $res }
+        [void]$br.ReadUInt64()                         # tensor count
+        $kvCount = $br.ReadUInt64()
+        if ($kvCount -gt 100000) { $res.Reason = 'implausible metadata count (corrupt header?)'; return $res }
+        $sizes = @{ 0 = 1; 1 = 1; 2 = 2; 3 = 2; 4 = 4; 5 = 4; 6 = 4; 7 = 1; 10 = 8; 11 = 8; 12 = 8 }
+        $kv = @{}
+        $readScalar = {
+            param($type)
+            switch ($type) {
+                0 { return [double]$br.ReadByte() } 1 { return [double]$br.ReadSByte() } 2 { return [double]$br.ReadUInt16() } 3 { return [double]$br.ReadInt16() }
+                4 { return [double]$br.ReadUInt32() } 5 { return [double]$br.ReadInt32() } 6 { return [double]$br.ReadSingle() } 7 { return [double]$br.ReadByte() }
+                10 { return [double]$br.ReadUInt64() } 11 { return [double]$br.ReadInt64() } 12 { return [double]$br.ReadDouble() }
+            }
+            return $null
+        }
+        for ($i = 0; $i -lt [int]$kvCount; $i++) {
+            $kl = $br.ReadUInt64()
+            if ($kl -gt 4096 -or ($fs.Position + [int64]$kl) -gt $len) { $res.Reason = 'corrupt metadata key'; return $res }
+            $key = [System.Text.Encoding]::UTF8.GetString($br.ReadBytes([int]$kl))
+            if ($key.StartsWith('tokenizer.')) { break }     # all architecture keys precede the (huge) tokenizer arrays
+            $type = $br.ReadUInt32()
+            $value = $null
+            if ($type -eq 8) {
+                $sl = $br.ReadUInt64()
+                if (($fs.Position + [int64][math]::Min([double]$sl, 9e15)) -gt $len) { $res.Reason = 'corrupt string value'; return $res }
+                if ($sl -le 256) { $value = [System.Text.Encoding]::UTF8.GetString($br.ReadBytes([int]$sl)) } else { [void]$fs.Seek([int64]$sl, [System.IO.SeekOrigin]::Current) }
+            }
+            elseif ($type -eq 9) {
+                $et = $br.ReadUInt32(); $cnt = $br.ReadUInt64()
+                if ($sizes.ContainsKey([int]$et)) {
+                    if ($cnt -le 512) { $arr = @(); for ($j = 0; $j -lt [int]$cnt; $j++) { $arr += (& $readScalar ([int]$et)) }; $value = $arr }
+                    else { [void]$fs.Seek([int64]$cnt * $sizes[[int]$et], [System.IO.SeekOrigin]::Current) }
+                } else { $res.Reason = 'metadata contains a large array before the architecture keys; not parsed'; return $res }
+            }
+            elseif ($sizes.ContainsKey([int]$type)) { $value = & $readScalar ([int]$type) }
+            else { $res.Reason = ('unknown metadata type {0}' -f $type); return $res }
+            if ($fs.Position -gt $len) { $res.Reason = 'metadata runs past the end of the file'; return $res }
+            $kv[$key] = $value
+        }
+        $arch = $kv['general.architecture']
+        if (-not $arch) { $res.Reason = 'general.architecture not found in the GGUF header'; return $res }
+        $res.Arch = [string]$arch
+        $get = { param($suffix) $v = $kv[($arch + '.' + $suffix)]; if ($v -is [array]) { $v = ($v | Measure-Object -Maximum).Maximum }; return $v }   # per-layer arrays: use the largest (conservative)
+        $res.BlockCount = & $get 'block_count'; $res.EmbeddingLength = & $get 'embedding_length'
+        $res.HeadCount = & $get 'attention.head_count'; $res.HeadCountKv = & $get 'attention.head_count_kv'
+        $res.KeyLength = & $get 'attention.key_length'; $res.ValueLength = & $get 'attention.value_length'
+        $res.ContextLength = & $get 'context_length'
+        $res.Ok = $true
+        return $res
+    } catch { $res.Reason = ('could not read GGUF header: ' + $_.Exception.Message); return $res }
+    finally { if ($fs) { $fs.Dispose() } }
+}
+
+function Get-PLlmMemoryEstimate {
+    # Weights + KV cache + overhead.  Confidence 'metadata' = KV cache computed from the GGUF header
+    #   KV = block_count * context * kv_heads * (key_len + value_len) * bytes_per_element
+    # Confidence 'low' = metadata unusable; KV is then a stated fraction of the weights (heuristic).
+    # MinBytes (weights + known KV) is the lower bound used for BLOCK; ExpectedBytes adds overhead and is used for WARN.
+    param([double]$FileBytes, $Meta, [int]$Context)
+    $pol = $script:PLlmMemPolicy
+    $kv = $null; $notes = New-Object System.Collections.ArrayList
+    if ($Meta -and $Meta.Ok -and $Meta.BlockCount -and $Meta.EmbeddingLength -and ($Meta.HeadCount -or $Meta.HeadCountKv)) {
+        $headKv = $Meta.HeadCountKv; if (-not $headKv) { $headKv = $Meta.HeadCount }
+        $keyLen = $Meta.KeyLength
+        if (-not $keyLen -and $Meta.HeadCount) { $keyLen = [double]$Meta.EmbeddingLength / [double]$Meta.HeadCount }
+        $valLen = $Meta.ValueLength; if (-not $valLen) { $valLen = $keyLen }
+        if ($keyLen -and $valLen -and $headKv) {
+            $kv = [double]$Meta.BlockCount * [double]$Context * [double]$headKv * ([double]$keyLen + [double]$valLen) * $pol.KvBytesPerElement
+        }
+    }
+    $overhead = $pol.OverheadFixedBytes + $pol.OverheadWeightFraction * $FileBytes
+    $conf = 'metadata'
+    $kvExpected = $kv
+    if ($null -eq $kv) {
+        $conf = 'low'
+        $kvExpected = $FileBytes * $pol.UnknownKvFractionPer4096 * ([double]$Context / 4096.0)
+        $why = 'GGUF metadata not available'; if ($Meta -and $Meta.Reason) { $why = $Meta.Reason } elseif ($Meta -and $Meta.Ok) { $why = 'GGUF header lacks the attention/layer keys' }
+        [void]$notes.Add(('KV cache size could not be computed ({0}); a heuristic is used, so this estimate is uncertain.' -f $why))
+    }
+    $min = $FileBytes; if ($null -ne $kv) { $min += $kv }
+    return [pscustomobject]@{ WeightsBytes = $FileBytes; KvBytes = $kv; KvExpectedBytes = $kvExpected; OverheadBytes = $overhead
+        MinBytes = $min; ExpectedBytes = ($FileBytes + $kvExpected + $overhead); Confidence = $conf; Context = $Context; Notes = @($notes) }
+}
+
+function Get-PLlmMemoryVerdict {
+    # PASS | WARN | BLOCK from an estimate and a memory reading { TotalBytes, AvailBytes, [CommitAvailBytes] }.
+    #   BLOCK (static)  : weights + KV cannot fit in total RAM minus a Windows reserve, however many programs are closed.
+    #   BLOCK (dynamic) : free RAM right now is below BlockAvailFraction of weights + KV (heavy paging expected).
+    #   WARN            : expected need plus headroom exceeds free RAM; or RAM could not be measured; or commit limit is tight.
+    #   PASS            : otherwise.  None of these is a guarantee either way.
+    param($Estimate, $Mem)
+    $pol = $script:PLlmMemPolicy
+    $reasons = New-Object System.Collections.ArrayList; $remedies = New-Object System.Collections.ArrayList
+    $out = [pscustomobject]@{ Verdict = 'WARN'; Measured = $false; Kind = ''; Reasons = @(); Remedies = @(); TotalBytes = $null; AvailBytes = $null
+                              MinBytes = $Estimate.MinBytes; ExpectedBytes = $Estimate.ExpectedBytes; Confidence = $Estimate.Confidence; SuggestedContext = $null; Notes = @($Estimate.Notes) }
+    if ($null -eq $Mem -or $null -eq $Mem.TotalBytes -or $null -eq $Mem.AvailBytes -or [double]$Mem.TotalBytes -le 0) {
+        $out.Kind = 'unmeasured'
+        $out.Reasons = @('Memory could not be measured on this computer, so no safety decision could be made. Expected need is about ' + (Format-PLlmBytes $Estimate.ExpectedBytes) + '.')
+        $out.Remedies = @('Check free RAM in Task Manager before continuing; close other programs if it is below that figure.')
+        return $out
+    }
+    $T = [double]$Mem.TotalBytes; $A = [double]$Mem.AvailBytes
+    $out.Measured = $true; $out.TotalBytes = $T; $out.AvailBytes = $A
+    $reserve = [math]::Max($pol.OsReserveMinBytes, $pol.OsReserveFraction * $T)
+    $machine = $T - $reserve
+    $min = $Estimate.MinBytes
+    $headroom = [math]::Max($pol.HeadroomMinBytes, $pol.HeadroomFraction * $T)
+    # A context size that would leave the KV cache inside a given RAM budget (weights and overhead already paid for).
+    $ctxFor = {
+        param([double]$budget)
+        if (-not ($Estimate.KvBytes -and $Estimate.KvBytes -gt 0)) { return $null }
+        $room = $budget - $Estimate.WeightsBytes - $Estimate.OverheadBytes
+        if ($room -le 0) { return $null }
+        $c = [int]([math]::Floor([double]$Estimate.Context * $room / $Estimate.KvBytes / 256.0) * 256)
+        if ($c -lt 256 -or $c -ge $Estimate.Context) { return $null }
+        return $c
+    }
+    $maxCtx = & $ctxFor ([math]::Min($machine, $A - $headroom))     # fits now AND is not larger than the PC could ever hold
+    if ($min -gt $machine) {
+        $out.Verdict = 'BLOCK'; $out.Kind = 'static'
+        [void]$reasons.Add(('The model needs at least {0} ({1}) but this PC has {2} in total ({3} after keeping {4} for Windows). It cannot be expected to fit even with every other program closed.' -f (Format-PLlmBytes $min), $(if ($Estimate.KvBytes) { 'weights + KV cache at context ' + $Estimate.Context } else { 'model weights alone' }), (Format-PLlmBytes $T), (Format-PLlmBytes $machine), (Format-PLlmBytes $reserve)))
+        [void]$remedies.Add('Choose a smaller model or a more heavily quantized file (for example Q4 instead of Q8).')
+        if ($maxCtx) { [void]$remedies.Add(('Lower CONTEXT in CONFIG.bat (about {0} might fit; an estimate, not a guarantee).' -f $maxCtx)) }
+    }
+    elseif ($A -lt ($pol.BlockAvailFraction * $min)) {
+        $out.Verdict = 'BLOCK'; $out.Kind = 'dynamic'
+        [void]$reasons.Add(('Only {0} of RAM is free right now, but the model needs at least {1} ({2}). Starting would force heavy paging and may make the whole PC unresponsive.' -f (Format-PLlmBytes $A), (Format-PLlmBytes $min), $(if ($Estimate.KvBytes) { 'weights + KV cache' } else { 'weights alone' })))
+        [void]$remedies.Add('Close memory-hungry programs (browsers with many tabs, games, editors) and start again; this may help but is not guaranteed.')
+        if ($maxCtx) { [void]$remedies.Add(('Lower CONTEXT in CONFIG.bat; about {0} might fit.' -f $maxCtx)) }
+        [void]$remedies.Add('Or choose a smaller model.')
+    }
+    else {
+        if ($Estimate.ExpectedBytes + $headroom -gt $A) {
+            $out.Verdict = 'WARN'; $out.Kind = 'tight'
+            [void]$reasons.Add(('Expected need is about {0} ({1} estimate) and {2} is free. This may work but is tight; other programs growing could cause paging or an out-of-memory failure.' -f (Format-PLlmBytes $Estimate.ExpectedBytes), $(if ($Estimate.Confidence -eq 'metadata') { 'from the GGUF header' } else { 'rough' }), (Format-PLlmBytes $A)))
+            [void]$remedies.Add('Close other memory-intensive programs; this may help but is not guaranteed.')
+            if ($maxCtx) { [void]$remedies.Add(('A smaller CONTEXT in CONFIG.bat (for example {0}) reduces the KV cache and might fit.' -f $maxCtx)) }
+            [void]$remedies.Add('Or choose a smaller model / quantization, or retry when more memory is free.')
+        } else { $out.Verdict = 'PASS'; $out.Kind = 'ok'
+            [void]$reasons.Add(('Expected need about {0} ({1}); {2} free.' -f (Format-PLlmBytes $Estimate.ExpectedBytes), $(if ($Estimate.Confidence -eq 'metadata') { 'estimate from GGUF header' } else { 'rough estimate' }), (Format-PLlmBytes $A))) }
+    }
+    if ($out.Verdict -ne 'BLOCK' -and $null -ne $Mem.CommitAvailBytes) {
+        $commitNeed = $Estimate.KvExpectedBytes + $Estimate.OverheadBytes
+        if ($commitNeed -gt [double]$Mem.CommitAvailBytes) {
+            if ($out.Verdict -eq 'PASS') { $out.Verdict = 'WARN'; $out.Kind = 'commit'; $out.Reasons = @(); $reasons.Clear() }
+            [void]$reasons.Add(('Windows has only {0} of commit (RAM + page file) left for the KV cache and buffers (about {1}). Allocation could fail.' -f (Format-PLlmBytes $Mem.CommitAvailBytes), (Format-PLlmBytes $commitNeed)))
+            [void]$remedies.Add('Close programs or enlarge the Windows page file.')
+        }
+    }
+    $out.Reasons = @($reasons); $out.Remedies = @($remedies)
+    return $out
+}
+
+function Invoke-PLlmMemoryProvider {
+    # A provider that throws is a failed measurement ($null -> explicit WARN 'could not be measured'), never a pass.
+    param([scriptblock]$Provider)
+    try { return (& $Provider) } catch { return $null }
+}
+
+function Invoke-PLlmLaunchGate {
+    # The only path to starting the server.  Measures, decides, re-measures immediately before launch, and calls -Start
+    # only if the final decision allows it.  A BLOCK without an explicit override NEVER calls -Start.
+    #   MemoryProvider : scriptblock -> { TotalBytes; AvailBytes; [CommitAvailBytes] } or $null (measurement failed)
+    #   MetadataReader : scriptblock(path) -> object like Read-PLlmGgufMetadata
+    #   Confirm        : scriptblock(verdict) -> $true only when the user explicitly confirmed a BLOCK (typed phrase)
+    #   Notify         : scriptblock(stage, verdict) for the caller to print; called once per distinct result
+    #   Start          : scriptblock(verdict) -> the server result
+    param([string]$ModelPath, [double]$FileBytes, [int]$Context, [scriptblock]$MemoryProvider, [scriptblock]$MetadataReader,
+          [bool]$AllowOverride = $false, [scriptblock]$Confirm = $null, [scriptblock]$Notify = $null, [scriptblock]$Start)
+    $meta = & $MetadataReader $ModelPath
+    $est = Get-PLlmMemoryEstimate -FileBytes $FileBytes -Meta $meta -Context $Context
+    $first = Get-PLlmMemoryVerdict $est (Invoke-PLlmMemoryProvider $MemoryProvider)
+    if ($Notify) { & $Notify 'preflight' $first }
+    $override = $false
+    if ($first.Verdict -eq 'BLOCK') {
+        if ($AllowOverride) { $override = $true }
+        elseif ($Confirm -and (& $Confirm $first)) { $override = $true }
+        else { return [pscustomobject]@{ Outcome = 'Blocked'; Started = $false; First = $first; Final = $first; OverrideUsed = $false; Estimate = $est; Result = $null } }
+    }
+    $final = Get-PLlmMemoryVerdict $est (Invoke-PLlmMemoryProvider $MemoryProvider)      # recheck: memory may have changed while the user read or answered
+    $rank = @{ PASS = 0; WARN = 1; BLOCK = 2 }
+    if ($rank[$final.Verdict] -ne $rank[$first.Verdict] -and $Notify) { & $Notify 'recheck' $final }
+    if ($final.Verdict -eq 'BLOCK' -and -not $override) {
+        return [pscustomobject]@{ Outcome = 'BlockedAtLaunch'; Started = $false; First = $first; Final = $final; OverrideUsed = $false; Estimate = $est; Result = $null }
+    }
+    $res = & $Start $final
+    return [pscustomobject]@{ Outcome = 'Started'; Started = $true; First = $first; Final = $final; OverrideUsed = $override; Estimate = $est; Result = $res }
 }

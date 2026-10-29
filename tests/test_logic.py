@@ -60,6 +60,11 @@ check('model-load start lines detected', all(RX['ModelLoadStart'].search(s) for 
 check('ready-by-log lines detected (and plain lines are not)', RX['ModelLoaded'].search('srv  update_slots: all slots are idle') and RX['ModelLoaded'].search('main: model loaded') and not RX['ModelLoaded'].search('srv  start: listening on http://127.0.0.1:8080'))
 check('error regex: real failures match, "error = 0" counters do not', RX['ErrorLine'].search("couldn't bind HTTP server socket") and RX['ErrorLine'].search('llama_model_load: error loading model: x') and RX['ErrorLine'].search('failed to allocate buffer') and not RX['ErrorLine'].search('stats: error = 0') and not RX['ErrorLine'].search('slot print_timing: id  0 | task 0 |'))
 check('warning regex', RX['WarnLine'].search('srv  warn: something') and not RX['WarnLine'].search('all slots are idle'))
+# request lifecycle regexes: the strings come from the bundled llama-server-impl.dll's own format strings
+check('task start/end regexes match llama.cpp slot lines', RX['TaskStart'].search('slot launch_slot_: id  0 | task 12 | processing task, is_child = 0').group(1) == '12' and RX['TaskEnd'].search('slot      release: id  0 | task 12 | stop processing: n_tokens = 223, truncated = 0').group(1) == '12' and not RX['TaskStart'].search('srv  update_slots: all slots are idle'))
+# KV-cache formula, computed independently of the PowerShell code: layers * ctx * kv_heads * (k_len + v_len) * 2 bytes (f16)
+def kv_bytes(layers, ctx, kv_heads, klen, vlen=None): return layers * ctx * kv_heads * (klen + (vlen or klen)) * 2
+check('KV formula: 28 layers, 8 kv heads, 128-dim, 4096 ctx = 448 MiB; doubling ctx doubles it', kv_bytes(28, 4096, 8, 128) == 448 * 2**20 and kv_bytes(28, 8192, 8, 128) == 2 * kv_bytes(28, 4096, 8, 128))
 # memory thresholds mirror (Get-PLlmMemoryLevel, no hysteresis)
 def memlevel(total, avail):
     used = 100.0 * (total - avail) / total; gb = avail / 2**30

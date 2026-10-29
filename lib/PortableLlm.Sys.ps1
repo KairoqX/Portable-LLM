@@ -25,11 +25,11 @@ public static class PLlmSys {
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     static extern bool GlobalMemoryStatusEx([In, Out] MEMORYSTATUSEX buffer);
-    public static bool GetMemory(out ulong total, out ulong avail) {
-        total = 0; avail = 0;
+    public static bool GetMemory(out ulong total, out ulong avail, out ulong commitLimit, out ulong commitAvail) {
+        total = 0; avail = 0; commitLimit = 0; commitAvail = 0;
         MEMORYSTATUSEX m = new MEMORYSTATUSEX();
         if (!GlobalMemoryStatusEx(m)) return false;
-        total = m.ullTotalPhys; avail = m.ullAvailPhys; return true;
+        total = m.ullTotalPhys; avail = m.ullAvailPhys; commitLimit = m.ullTotalPageFile; commitAvail = m.ullAvailPageFile; return true;
     }
 
     [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int which);
@@ -84,12 +84,22 @@ public static class PLlmSys {
 
 function Get-PLlmMemoryInfo {
     # Physical RAM from GlobalMemoryStatusEx.  Returns $null when unavailable (never a made-up number).
+    # TEST SEAM (documented in docs/PREFLIGHT.md): PORTABLE_LLM_TEST_MEMORY="totalBytes,availBytes[,commitAvailBytes]" replaces the
+    # real reading so launcher scenarios are deterministic without touching the machine's memory.  Malformed -> $null (unmeasured).
+    if ($env:PORTABLE_LLM_TEST_MEMORY) {
+        $parts = @($env:PORTABLE_LLM_TEST_MEMORY -split ',')
+        $tt = 0.0; $aa = 0.0
+        if ($parts.Count -lt 2 -or -not [double]::TryParse($parts[0], [ref]$tt) -or -not [double]::TryParse($parts[1], [ref]$aa) -or $tt -le 0) { return $null }
+        $ca = $null; $cc = 0.0; if ($parts.Count -ge 3 -and [double]::TryParse($parts[2], [ref]$cc)) { $ca = $cc }
+        return [pscustomobject]@{ TotalBytes = $tt; AvailBytes = $aa; UsedPct = (100.0 * ($tt - $aa) / $tt); CommitLimitBytes = $null; CommitAvailBytes = $ca }
+    }
     if (-not (Initialize-PLlmSys)) { return $null }
     try {
-        $t = [uint64]0; $a = [uint64]0
-        if (-not [PLlmSys]::GetMemory([ref]$t, [ref]$a) -or $t -eq 0) { return $null }
+        $t = [uint64]0; $a = [uint64]0; $cl = [uint64]0; $ca = [uint64]0
+        if (-not [PLlmSys]::GetMemory([ref]$t, [ref]$a, [ref]$cl, [ref]$ca) -or $t -eq 0) { return $null }
         $used = [double]($t - $a) * 100.0 / [double]$t
-        return [pscustomobject]@{ TotalBytes = [double]$t; AvailBytes = [double]$a; UsedPct = $used }
+        # CommitAvailBytes = RAM + page file that can still be promised to programs (a real pressure signal)
+        return [pscustomobject]@{ TotalBytes = [double]$t; AvailBytes = [double]$a; UsedPct = $used; CommitLimitBytes = [double]$cl; CommitAvailBytes = [double]$ca }
     } catch { return $null }
 }
 
